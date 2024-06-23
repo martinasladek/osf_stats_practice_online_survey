@@ -1,0 +1,1807 @@
+---
+title: "Data analysis: Multiple imputation"
+author: "MS"
+date: "22/09/2021"
+output: html_document
+---
+
+IMPORTANT: The original dataset collected information about university name which was then paired with a world rank. Both of these variables could be used to identify participants at institutions which, at the time, did not tie on ranks with any other institutions. Because of this, the variables were removed from the dataset. 
+
+The variable `world_rank` was replaced with a randomly generated variable that correlated with the original rank with r = 0.9. Therefore the code below will still be able to run, however please note that any computations that use `world_rank` will not be exactly reproducible. 
+
+The main analysis in the file `analysis_models.Rmd` uses the actual data that was used to fit the models reported in the manuscript. The statistical models used a categorical version of the variable (`world_rank` split into 4 levels), which doesn't pose risk of de-identification and was therefore retained. Basically, the statistical models `analysis_models.Rmd` can be reproduced exactly, but not the imputation. 
+
+```{r setup, include=TRUE, echo = TRUE, message = F, warning = F}
+knitr::opts_chunk$set(echo = TRUE, message = F, warning = F)
+
+library(brms)
+library(dplyr)
+library(ggplot2)
+library(magrittr)
+library(mice)
+library(patchwork)
+library(tidybayes)
+library(tidytext) 
+
+
+source("../scripts/helpers.R")
+
+# read processed dataset
+data <- readRDS("../data/processed_data/stats_practice_processed_data_081221_world_rank_deidentified.rds")
+
+# read imputed datasets
+imp_data_list <- readRDS("../data/processed_data/imputed_data_1-n_040122_world_rank_removed.rds")
+
+# read the original imputed dataset (imputation from mice within index 0)
+imp_data_0 <- readRDS("../data/processed_data/imputed_data_0_040122_world_rank_removed.rds")
+
+imp_data_list_s1 <- purrr::map(imp_data_list, ~dplyr::filter(.x, scenario == "s1"))
+
+```
+
+# Reprocess variables 
+
+```{r}
+data %<>% 
+  dplyr::filter(!demo_level %in% c("Undergraduate taught student", "Postgraduate taught student")) %>% 
+  dplyr::mutate(
+    
+    across(
+      .cols = c(ri_subfield, ri_preferred_ht, recruitment,
+                s1_n_check_lin:s2_n_check_norm_sam, 
+                methods_select_1:methods_select_24), 
+      .fns = factor
+    ),
+    
+    ri_teach = factor(ri_teach, levels = c("Yes", "No")), 
+    ri_subfield = forcats::fct_relevel(ri_subfield, "Methods and meta-science", after = 0L), 
+    ri_subfield = factor(ri_subfield, 
+                         labels = c("Methods", "Biological", "Clinical", "Cognitive", "Developmental", "Forensic", "Social")),
+    demo_level = factor(demo_level, levels = c("Faculty", 
+                                               "Postdoctoral researcher", "PhD researcher", 
+                                               "Undergraduate taught student", "Postgraduate taught student", 
+                                               "Non-academic researcher")), 
+    # world_rank = case_when(
+    #   rank == -99 ~ as.integer(1500), 
+    #   rank == -999 ~ as.integer(-999), 
+    #   is.na(rank) ~ as.integer(NA),
+    #   TRUE ~ world_rank
+    # ), 
+    # rank = case_when(
+    #   world_rank == 1500 ~ 4, 
+    #   world_rank %in% c(501:1001) ~ 3,
+    #   world_rank %in% c(201:500) ~ 2,
+    #   world_rank %in% c(1:200) ~ 1
+    # )
+  ) 
+
+```
+
+# Demographics 
+
+## Gender
+
+
+```{r}
+gender_sum <- data %>%
+  dplyr::group_by(demo_gender) %>%
+  summarise(
+    n = n(), 
+    percent = round(n/nrow(.)*100, 2)
+  ) %>% tibble::column_to_rownames(., var = "demo_gender")
+
+gender_sum %>% lazy_kable()
+```
+
+
+Men: `r gender_sum["Man", "n"]` (`r gender_sum["Man", "percent"]`%)  
+Women: `r gender_sum["Womn", "n"]` (`r gender_sum["Woman", "percent"]`%)  
+Non-binary: `r gender_sum["Non-binary", "n"]` (`r gender_sum["Non-binary", "percent"]`%)  
+Genderqueer: `r gender_sum["Genderqueer", "n"]` (`r gender_sum["Genderqueer", "percent"]`%)  
+Not specified: `r gender_sum["Not specified", "n"]` (`r gender_sum["Not specified", "percent"]`%)  
+
+## Age 
+
+```{r}
+data[which(data$demo_age == 99), "demo_age"] <- as.numeric(NA)
+
+mean_age = round(mean(data$demo_age, na.rm = T), 2)
+sd_age = round(sd(data$demo_age, na.rm = T), 2)
+```
+
+$M$ = `r mean_age` ($SD$ = `r sd_age`) 
+
+## Research seniority
+
+```{r}
+demo_level_sum <- data %>%
+  dplyr::group_by(demo_level = as.character(demo_level)) %>%
+  summarise(
+    n = n(), 
+    percent = round(n/nrow(.)*100, 2)
+  ) %>% 
+  dplyr::mutate(demo_level = c(demo_level[1:4], "Missing")) %>% 
+  tibble::column_to_rownames("demo_level")
+
+demo_level_sum %>% lazy_kable()
+
+```
+
+Faculty: `r demo_level_sum["Faculty", "n"]` (`r demo_level_sum["Faculty", "percent"]`%)  
+Non-academic researcher: `r demo_level_sum["Non-academic researcher", "n"]` (`r demo_level_sum["Non-academic researcher", "percent"]`%)  
+PhD researcher: `r demo_level_sum["PhD researcher", "n"]` (`r demo_level_sum["PhD researcher", "percent"]`%)  
+Postdoctoral researcher: `r demo_level_sum["Postdoctoral researcher", "n"]` (`r demo_level_sum["Postdoctoral researcher", "percent"]`%)  
+Missing: `r demo_level_sum["Missing", "n"]` (`r demo_level_sum["Missing", "percent"]`%)  
+
+
+
+## Psychology subfield 
+
+```{r}
+ri_subfield_sum <- data %>%
+  dplyr::group_by(ri_subfield = as.character(ri_subfield)) %>%
+  dplyr::summarise(
+    n = n(), 
+    percent = round(n/nrow(.) * 100, 2)
+  ) %>%
+  dplyr::mutate(ri_subfield = c(ri_subfield[1:7], "Missing")) %>% 
+  tibble::column_to_rownames("ri_subfield")
+
+ri_subfield_sum %>% lazy_kable()
+```
+
+Biological:    `r ri_subfield_sum["Biological", "n"]` (`r ri_subfield_sum["Biological", "percent"]`%)  
+Clinical:      `r ri_subfield_sum["Clinical", "n"]` (`r ri_subfield_sum["Clinical", "percent"]`%)  
+Cognitive:     `r ri_subfield_sum["Cognitive", "n"]` (`r ri_subfield_sum["Cognitive", "percent"]`%)  
+Developmental: `r ri_subfield_sum["Developmental", "n"]` (`r ri_subfield_sum["Developmental", "percent"]`%)  
+Forensic:      `r ri_subfield_sum["Forensic", "n"]` (`r ri_subfield_sum["Forensic", "percent"]`%)  
+Methods:       `r ri_subfield_sum["Methods", "n"]` (`r ri_subfield_sum["Methods", "percent"]`%)  
+Social:        `r ri_subfield_sum["Social", "n"]` (`r ri_subfield_sum["Social", "percent"]`%)  
+Missing:       `r ri_subfield_sum["Missing", "n"]` (`r ri_subfield_sum["Missing", "percent"]`%)  
+
+## Teach methods
+
+```{r}
+ri_teach_sum <- data %>%
+  dplyr::group_by(ri_teach) %>%
+  dplyr::summarise(
+    n = n(), 
+    percent = round(n/nrow(.) * 100, 2)
+  ) 
+
+ri_teach_sum %>% lazy_kable()
+```
+
+## Psychology subfield within teach
+
+```{r}
+ri_teach_subfield_sum <- data %>%
+  dplyr::group_by(ri_teach, ri_subfield = as.character(ri_subfield)) %>%
+  dplyr::summarise(
+    n = n(), 
+    percent = round(n/nrow(.) * 100, 2)
+  ) %>%
+  dplyr::ungroup() %>% 
+  dplyr::mutate(ri_teach = c("Yes", rep("", 6), "No", rep("", 7), "NA")) 
+
+ri_teach_subfield_sum %>% lazy_kable()
+
+```
+
+
+# -----
+
+# Model summaries 
+
+**IMPORTANT:** The following summaries require the model objects exported from `brms` to exist. Therefore to run the summaries, you need to first run the script `analysis_models.Rmd` that creates these objects. 
+
+## Knowledge models 
+
+### Overall 
+
+```{r}
+knowledge_mod_overall <- readRDS("../objects/models/knowledge_mod_overall_040122.rds")
+```
+
+```{r}
+knowledge_mod_overall_list <- generate_summary_objects(knowledge_mod_overall, "Overall")
+
+knowledge_mod_overall_list$means_ri_teach <- 
+  estimated_means(knowledge_mod_overall_list$b, predictor_string = "ri_teach", levels = c("Yes", "No"), assumption = "Overall")
+
+knowledge_mod_overall_list$means_ri_subfield <-
+  estimated_means(knowledge_mod_overall_list$b, 
+                  predictor_string = "ri_subfield", 
+                  levels = c("Methods", "Biological", "Clinical", "Cognitive", "Developmental", "Social"), 
+                  assumption = "Overall")
+
+knowledge_mod_overall_list$means_uni_rank <- 
+  estimated_means(knowledge_mod_overall_list$b, 
+                  predictor_string = "uni_rank", 
+                  levels = c("1-200", "201-500", "501-1000", "Not ranked"), 
+                  assumption = "Overall")
+
+
+backpack$knowledge_mod_overall_list <- knowledge_mod_overall_list
+```
+
+
+
+### Normality 
+
+```{r}
+knowledge_mod_norm <- readRDS("../objects/models/knowledge_mod_norm_040122.rds")
+```
+
+```{r}
+assumption_label = "Normality"
+
+knowledge_mod_norm_list <- generate_summary_objects(knowledge_mod_norm, assumption_label)
+
+knowledge_mod_norm_list$means_ri_teach <- 
+  estimated_means(knowledge_mod_norm_list$b, predictor_string = "ri_teach", levels = c("Yes", "No"), assumption = assumption_label)
+
+knowledge_mod_norm_list$means_ri_subfield <-
+  estimated_means(knowledge_mod_norm_list$b, 
+                  predictor_string = "ri_subfield", 
+                  levels = c("Methods", "Biological", "Clinical", "Cognitive", "Developmental", "Social"), 
+                  assumption = assumption_label)
+
+knowledge_mod_norm_list$means_uni_rank <- 
+  estimated_means(knowledge_mod_norm_list$b, 
+                  predictor_string = "uni_rank", 
+                  levels = c("1-200", "201-500", "501-1000", "Not ranked"), 
+                  assumption = assumption_label)
+
+backpack$knowledge_mod_norm_list <- knowledge_mod_norm_list
+```
+
+
+### heteroscedasticity 
+
+```{r}
+knowledge_mod_het <- readRDS("../objects/models/knowledge_mod_het_040122.rds")
+```
+
+```{r}
+assumption_label = "Homoscedasticity"
+
+knowledge_mod_het_list <- generate_summary_objects(knowledge_mod_het, assumption_label)
+
+knowledge_mod_het_list$means_ri_teach <- 
+  estimated_means(knowledge_mod_het_list$b, predictor_string = "ri_teach", levels = c("Yes", "No"), assumption = assumption_label)
+
+knowledge_mod_het_list$means_ri_subfield <-
+  estimated_means(knowledge_mod_het_list$b, 
+                  predictor_string = "ri_subfield", 
+                  levels = c("Methods", "Biological", "Clinical", "Cognitive", "Developmental", "Social"), 
+                  assumption = assumption_label)
+
+knowledge_mod_het_list$means_uni_rank <- 
+  estimated_means(knowledge_mod_het_list$b, 
+                  predictor_string = "uni_rank", 
+                  levels = c("1-200", "201-500", "501-1000", "Not ranked"), 
+                  assumption = assumption_label)
+
+backpack$knowledge_mod_het_list <- knowledge_mod_het_list
+```
+
+### Outliers and influential cases 
+
+```{r}
+knowledge_mod_out_inf <- readRDS("../objects/models/knowledge_mod_out_inf_040122.rds")
+```
+
+```{r}
+assumption_label = "Outliers"
+
+knowledge_mod_out_inf_list <- generate_summary_objects(knowledge_mod_out_inf, assumption_label)
+
+knowledge_mod_out_inf_list$means_ri_teach <- 
+  estimated_means(knowledge_mod_out_inf_list$b, predictor_string = "ri_teach", levels = c("Yes", "No"), assumption = assumption_label)
+
+knowledge_mod_out_inf_list$means_ri_subfield <-
+  estimated_means(knowledge_mod_out_inf_list$b, 
+                  predictor_string = "ri_subfield", 
+                  levels = c("Methods", "Biological", "Clinical", "Cognitive", "Developmental", "Social"), 
+                  assumption = assumption_label)
+
+knowledge_mod_out_inf_list$means_uni_rank <- 
+  estimated_means(knowledge_mod_out_inf_list$b, 
+                  predictor_string = "uni_rank", 
+                  levels = c("1-200", "201-500", "501-1000", "Not ranked"), 
+                  assumption = assumption_label)
+
+backpack$knowledge_mod_out_inf_list <- knowledge_mod_out_inf_list
+```
+
+### Linearity 
+
+```{r}
+knowledge_mod_lin <- readRDS("../objects/models/knowledge_mod_lin_040122.rds")
+```
+
+```{r}
+assumption_label = "Linearity"
+
+knowledge_mod_lin_list <- generate_summary_objects(knowledge_mod_lin, assumption_label)
+
+knowledge_mod_lin_list$means_ri_teach <- 
+  estimated_means(knowledge_mod_lin_list$b, predictor_string = "ri_teach", levels = c("Yes", "No"), assumption = assumption_label)
+
+knowledge_mod_lin_list$means_ri_subfield <-
+  estimated_means(knowledge_mod_lin_list$b, 
+                  predictor_string = "ri_subfield", 
+                  levels = c("Methods", "Biological", "Clinical", "Cognitive", "Developmental", "Social"), 
+                  assumption = assumption_label)
+
+knowledge_mod_lin_list$means_uni_rank <- 
+  estimated_means(knowledge_mod_lin_list$b, 
+                  predictor_string = "uni_rank", 
+                  levels = c("1-200", "201-500", "501-1000", "Not ranked"), 
+                  assumption = assumption_label)
+
+
+backpack$knowledge_mod_lin_list <- knowledge_mod_lin_list
+```
+
+### Independence 
+
+```{r}
+knowledge_mod_ind <- readRDS("../objects/models/knowledge_mod_ind_040122.rds")
+```
+
+```{r}
+assumption_label = "Independence"
+
+knowledge_mod_ind_list <- generate_summary_objects(knowledge_mod_ind, assumption_label)
+
+knowledge_mod_ind_list$means_ri_teach <- 
+  estimated_means(knowledge_mod_ind_list$b, predictor_string = "ri_teach", levels = c("Yes", "No"), assumption = assumption_label)
+
+knowledge_mod_ind_list$means_ri_subfield <-
+  estimated_means(knowledge_mod_ind_list$b, 
+                  predictor_string = "ri_subfield", 
+                  levels = c("Methods", "Biological", "Clinical", "Cognitive", "Developmental", "Social"), 
+                  assumption = assumption_label)
+
+knowledge_mod_ind_list$means_uni_rank <- 
+  estimated_means(knowledge_mod_ind_list$b, 
+                  predictor_string = "uni_rank", 
+                  levels = c("1-200", "201-500", "501-1000", "Not ranked"), 
+                  assumption = assumption_label)
+
+backpack$knowledge_mod_ind_list <- knowledge_mod_ind_list
+```
+
+
+### -----
+
+### plot: ri_teach
+
+```{r}
+knowledge_mod_ri_teach = rbind(
+  knowledge_mod_overall_list$means_ri_teach, 
+  knowledge_mod_norm_list$means_ri_teach, 
+  knowledge_mod_het_list$means_ri_teach, 
+  knowledge_mod_out_inf_list$means_ri_teach, 
+  knowledge_mod_lin_list$means_ri_teach, 
+  knowledge_mod_ind_list$means_ri_teach
+) %>% dplyr::mutate(term = factor(term, levels = c("Yes", "No")), 
+                    assumption = factor(assumption))
+
+```
+
+```{r}
+knowledge_raw_ri_teach <- imp_data_0 %>% 
+  dplyr::select(id, ri_teach, contains("mean")) %>% 
+  tidyr::pivot_longer(cols = c(-id, -ri_teach), names_to = "assumption") %>% 
+  dplyr::mutate(
+    assumption = factor(assumption, 
+                        labels = c("Homoscedasticity", "Independence", "Linearity", "Normality", "Outliers", "Overall")), 
+  ) %>% 
+  dplyr::filter(!is.na(value), !is.na(ri_teach))
+
+```
+
+
+```{r message = F, warning = F, fig.width=8}
+dodge_width = 0.5
+
+p_knowledge_ri_teach <- ggplot2::ggplot(data = knowledge_mod_ri_teach, aes(colour = term, y = Estimate, x = assumption)) + 
+  geom_point(data = knowledge_raw_ri_teach, aes(colour = ri_teach, y = value, x = assumption), 
+             position = position_dodge(width = dodge_width), alpha = 0.006) + 
+  geom_point(position = position_dodge(width = dodge_width)) +
+  geom_errorbar(
+    ymin = knowledge_mod_ri_teach$lower, ymax = knowledge_mod_ri_teach$upper,
+    width = 0.2,
+    size = .65,
+    position = position_dodge(width = dodge_width)) +
+  labs(x = "", y = "Knowledge of assumtptions (0-10) \n", colour = "Research methods\nteaching\n") + 
+  coord_cartesian(ylim = c(0, 10)) + 
+  scale_y_continuous(minor_breaks = seq(1, 9, 2), breaks = seq(0,10,1) ) + 
+  scale_colour_manual(values = c(mon$m5, mon$m9)) + 
+  theme_light() + 
+  theme(
+    legend.position = "top", 
+    text = element_text(family = "serif"),
+    axis.text.x = element_text(vjust = 1, angle = 45, hjust = 1)
+  ) + 
+  guides(colour = guide_legend(title.position = "top", title.hjust = 0.5))
+
+```
+
+### plot: ri_subfield
+
+```{r}
+knowledge_mod_ri_subfield = rbind(
+  knowledge_mod_overall_list$means_ri_subfield, 
+  knowledge_mod_norm_list$means_ri_subfield, 
+  knowledge_mod_het_list$means_ri_subfield, 
+  knowledge_mod_out_inf_list$means_ri_subfield, 
+  knowledge_mod_lin_list$means_ri_subfield, 
+  knowledge_mod_ind_list$means_ri_subfield
+) %>% dplyr::mutate(term = factor(term) %>% forcats::fct_relevel("Methods", after = 0L))
+
+```
+
+```{r}
+knowledge_raw_ri_subfield <- imp_data_0 %>% 
+  dplyr::select(id, ri_subfield, contains("mean")) %>% 
+  tidyr::pivot_longer(cols = c(-id, -ri_subfield), names_to = "assumption") %>% 
+  dplyr::mutate(
+    assumption = factor(assumption, 
+                        labels = c("Homoscedasticity", "Independence", "Linearity", "Normality", "Outliers", "Overall"))
+  ) %>% 
+  dplyr::filter(!is.na(value), !is.na(ri_subfield))
+
+```
+
+
+```{r message = F, warning = F, fig.width=8}
+dodge_width = 0.8
+
+p_knowledge_ri_subfield <- ggplot2::ggplot(data = knowledge_mod_ri_subfield, aes(colour = term, y = Estimate, x = assumption)) + 
+  
+  
+  geom_point(data = knowledge_raw_ri_subfield, aes(colour = ri_subfield, y = value, x = assumption, group = ri_subfield), 
+             position = position_dodge(width = dodge_width), alpha = c(0.014)) + 
+  
+  
+  geom_point(position = position_dodge(width = dodge_width)) +
+  
+  geom_errorbar(
+    ymin = knowledge_mod_ri_subfield$lower, ymax = knowledge_mod_ri_subfield$upper,
+    width = 0.3, 
+    size = .65, 
+    position = position_dodge(width = dodge_width)) + 
+  labs(x = "", y = "", colour = "Psychology subfield\n") + 
+  #facet_wrap(~term) + 
+  coord_cartesian(ylim = c(0, 10)) + 
+  scale_y_continuous(minor_breaks = seq(1, 9, 2), breaks = seq(0,10,1) ) + 
+  scale_colour_manual(values = c(mon$m4, mon$m5, mon$m6, mon$m7, mon$m8, mon$m9)) + 
+  theme_light() + 
+  theme(
+    legend.position = "top", 
+    text = element_text(family = "serif"),
+    axis.text.x = element_text(vjust = 1, angle = 45, hjust = 1)
+  ) + 
+  guides(colour = guide_legend(title.position = "top", title.hjust = 0.5, nrow = 1))
+
+```
+
+```{r}
+x_label <- ggplot2::ggplot(data = data.frame(y = rep(1, 10), x = 1:10)) + 
+  annotate("text", x = 5, y = 1, label = "OLS assumption", family = "serif") + 
+  theme_void() 
+
+```
+
+
+```{r fig.width=8.3, warning = F}
+layout <- "
+AABBBBBB
+CCCCCCCC
+"
+
+((p_knowledge_ri_teach + p_knowledge_ri_subfield) +  x_label) + 
+  plot_layout(design = layout, heights = c(9,1))
+```
+
+
+### plot: uni_rank
+
+```{r}
+knowledge_mod_uni_rank = rbind(
+  knowledge_mod_overall_list$means_uni_rank, 
+  knowledge_mod_norm_list$means_uni_rank, 
+  knowledge_mod_het_list$means_uni_rank, 
+  knowledge_mod_out_inf_list$means_uni_rank, 
+  knowledge_mod_lin_list$means_uni_rank, 
+  knowledge_mod_ind_list$means_uni_rank
+) 
+
+knowledge_mod_uni_rank
+```
+
+```{r}
+knowledge_raw_uni_rank <- imp_data_0 %>% 
+  dplyr::select(id, uni_rank_cat, contains("mean")) %>% 
+  tidyr::pivot_longer(cols = c(-id, -uni_rank_cat), names_to = "assumption") %>% 
+  dplyr::mutate(
+    assumption = factor(assumption, 
+                        labels = c("Homoscedasticity", "Independence", "Linearity", "Normality", "Outliers", "Overall")), 
+    uni_rank_cat = factor(uni_rank_cat, 
+                          labels = c("1-200", "201-500", "501-1000", "Not ranked"))
+  ) %>% 
+  dplyr::filter(!is.na(value), !is.na(uni_rank_cat))
+
+```
+
+
+```{r message = F, warning = F, fig.width=6, fig.height=5}
+dodge_width = 0.5
+
+p_knowledge_uni_rank <- ggplot2::ggplot(data = knowledge_mod_uni_rank, aes(colour = term, y = Estimate, x = assumption)) + 
+  
+  
+  geom_point(data = knowledge_raw_uni_rank, aes(colour = uni_rank_cat, y = value, x = assumption, group = uni_rank_cat), 
+             position = position_dodge(width = dodge_width), alpha = c(0.014)) + 
+  
+  
+  geom_point(position = position_dodge(width = dodge_width)) +
+  
+  geom_errorbar(
+    ymin = knowledge_mod_uni_rank$lower, ymax = knowledge_mod_uni_rank$upper,
+    width = 0.3, 
+    size = .65, 
+    position = position_dodge(width = dodge_width)) + 
+  labs(x = "OLS assumption", y = "", colour = "World university rank catgegory") + 
+  #facet_wrap(~term) + 
+  coord_cartesian(ylim = c(0, 10)) + 
+  scale_y_continuous(minor_breaks = seq(1, 9, 2), breaks = seq(0,10,1) ) + 
+  scale_colour_manual(values = c(mon$m4, mon$m6, mon$m8, mon$m9)) + 
+  theme_light() + 
+  theme(
+    legend.position = "top", 
+    text = element_text(family = "serif"),
+    axis.text.x = element_text(vjust = 1, angle = 45, hjust = 1)
+  ) + 
+  guides(colour = guide_legend(title.position = "top", title.hjust = 0.5))
+
+
+p_knowledge_uni_rank
+```
+
+### -----
+
+## Practice models 
+
+### Overall 
+
+```{r}
+practice_mod_overall <- readRDS("../objects/models/practice_mod_overall_040122.rds")
+```
+
+```{r}
+practice_mod_overall_em_draws <- practice_mod_overall %>%
+  emmeans::emmeans(~scenario + tf_overall_mean + ri_teach + ri_subfield + uni_rank_cat) %>%
+  tidybayes::gather_emmeans_draws()
+
+```
+
+
+```{r}
+assumption_label = "Overall"
+practice_mod_overall_list <- generate_summary_objects(practice_mod_overall, assumption_label)
+
+practice_mod_overall_list$means_scenario <- 
+  practice_mod_overall_em_draws %>%
+  dplyr::group_by(scenario) %>%
+  dplyr::filter(ri_teach == "Yes", ri_subfield == "Methods", uni_rank_cat == 1) %>%
+  dplyr::summarise(Estimate = median(.value, na.rm = T), 
+                   lower = HDInterval::hdi(.value)[1], 
+                   upper = HDInterval::hdi(.value)[2], 
+                   assumption = assumption_label) %>% 
+  dplyr::mutate(scenario = factor(scenario, labels = c("Experimental", "Cross-sectional")))
+
+
+practice_mod_overall_list$means_ri_teach <- 
+  practice_mod_overall_em_draws %>%
+  dplyr::group_by(ri_teach) %>%
+  dplyr::filter(scenario == "s1", ri_subfield == "Methods", uni_rank_cat == 1) %>%
+  dplyr::summarise(Estimate = median(.value, na.rm = T), 
+                   lower = HDInterval::hdi(.value)[1], 
+                   upper = HDInterval::hdi(.value)[2], 
+                   assumption = assumption_label) %>% 
+  dplyr::mutate(ri_teach = factor(ri_teach, labels = c("Yes", "No")))
+
+
+practice_mod_overall_list$means_ri_subfield <-
+  practice_mod_overall_em_draws %>%
+  dplyr::group_by(ri_subfield) %>%
+  dplyr::filter(scenario == "s1", ri_teach == "Yes", uni_rank_cat == 1) %>%
+  dplyr::summarise(Estimate = median(.value, na.rm = T), 
+                   lower = HDInterval::hdi(.value)[1], 
+                   upper = HDInterval::hdi(.value)[2], 
+                   assumption = assumption_label) %>% 
+  dplyr::ungroup() %>% 
+  dplyr::mutate(ri_subfield = factor(ri_subfield, labels = 
+                  c("Methods", "\nBiological", "Clinical", "\nCognitive",
+                    "Developmental", "\nSocial")))
+
+
+practice_mod_overall_list$means_uni_rank <- 
+  practice_mod_overall_em_draws %>%
+  dplyr::group_by(uni_rank_cat) %>%
+  dplyr::filter(scenario == "s1", ri_teach == "Yes", ri_subfield == "Methods") %>%
+  dplyr::summarise(Estimate = median(.value, na.rm = T), 
+                   lower = HDInterval::hdi(.value)[1], 
+                   upper = HDInterval::hdi(.value)[2], 
+                   assumption = assumption_label) %>% 
+  dplyr::mutate(uni_rank_cat = factor(uni_rank_cat, labels = c("1-200", "201-500", "501-1000", "Not ranked")))
+
+practice_mod_overall_list$means_knowledge <- conditional_means_cont(overall_practice_mod = practice_mod_overall, 
+                                                                    continuous_predictor = "tf_overall_mean", 
+                                                                    assumption_label = "Overall")
+
+
+backpack$practice_mod_overall_list <- practice_mod_overall_list
+```
+
+
+#### plot: scenario 
+
+```{r}
+practice_overall_scenario_raw <- imp_data_0 %>% 
+  dplyr::select(id, scenario, check_sum) %>% 
+  dplyr::filter(complete.cases(check_sum)) %>% 
+  dplyr::group_by(check_sum, scenario) %>% 
+  dplyr::mutate(n = n()/1000/1.5) %>% 
+  dplyr::ungroup() %>% 
+  dplyr::mutate(scenario = factor(scenario, labels = c("Experimental", "Cross-sectional")))
+
+```
+
+
+```{r}
+p_practice_scenario <- ggplot2::ggplot(data = practice_mod_overall_list$means_scenario, aes(x = scenario, y = Estimate)) + 
+  geom_point(data = practice_overall_scenario_raw, aes(x = scenario, y = check_sum, colour = scenario), 
+             position = position_jitter(width = practice_overall_scenario_raw$n, height = 0,  seed = 1234), 
+             alpha = 0.03) + 
+  geom_point(size = 2) +
+  geom_errorbar(
+    ymin = practice_mod_overall_list$means_scenario$lower, ymax = practice_mod_overall_list$means_scenario$upper,
+    width = 0.1, 
+    size = .65, 
+  ) + 
+  scale_colour_manual(values = c(mon$m5, mon$m9)) + 
+  labs(x = "\n Scenario\n", y = "Self-reported practice (0-10) \n") + 
+  coord_cartesian(ylim = c(0, 10)) + 
+  scale_y_continuous(breaks = seq(0, 10, 1)) + 
+  theme_light() + 
+  theme(
+    text = element_text(family = "serif"),
+    legend.position = "none", 
+    panel.grid.major = element_line(colour = "#ededed"), 
+    panel.grid.minor = element_blank()
+    
+  )
+
+```
+
+#### plot: ri_teach 
+
+```{r}
+practice_overall_ri_teach_raw <- imp_data_0 %>% 
+  dplyr::select(id, ri_teach, check_sum) %>% 
+  dplyr::filter(!is.na(check_sum), !is.na(ri_teach)) %>% 
+  dplyr::group_by(check_sum, ri_teach) %>% 
+  dplyr::mutate(n = n()/1000/1.5)
+```
+
+
+```{r}
+p_practice_ri_teach <- ggplot2::ggplot(data = practice_mod_overall_list$means_ri_teach, aes(x = ri_teach, y = Estimate)) + 
+  geom_point(data = practice_overall_ri_teach_raw, aes(x = ri_teach, y = check_sum, colour = ri_teach), 
+             position = position_jitter(width = practice_overall_ri_teach_raw$n, height = 0,  seed = 1234), 
+             alpha = 0.03) + 
+  geom_point(size = 2) +
+  geom_errorbar(
+    ymin = practice_mod_overall_list$means_ri_teach$lower, ymax = practice_mod_overall_list$means_ri_teach$upper,
+    width = 0.1, 
+    size = .65, 
+  ) + 
+  scale_colour_manual(values = c(mon$m5, mon$m9)) +  
+  labs(x = "\n Research methods teaching\n", y = "\n") + 
+  coord_cartesian(ylim = c(0, 10)) + 
+  scale_y_continuous(breaks = seq(0, 10, 1)) + 
+  theme_light() + 
+  theme(
+    text = element_text(family = "serif"),
+    legend.position = "none", 
+    panel.grid.major = element_line(colour = "#ededed"), 
+    panel.grid.minor = element_blank()
+    
+  )
+```
+
+#### plot: ri_subfield 
+
+
+```{r}
+practice_overall_ri_subfield_raw <- imp_data_0 %>% 
+  dplyr::select(id, ri_subfield, check_sum) %>% 
+  dplyr::filter(!is.na(check_sum), !is.na(ri_subfield)) %>% 
+  dplyr::group_by(check_sum, ri_subfield) %>% 
+  dplyr::mutate(n = n()/100/3) %>% 
+  dplyr::ungroup() %>% 
+  dplyr::mutate(ri_subfield = factor(ri_subfield, labels = 
+                  c("Methods", "\nBiological", "Clinical", "\nCognitive",
+                    "Developmental", "\nSocial"))
+                )
+```
+
+
+```{r}
+p_practice_ri_subfield <- 
+  ggplot2::ggplot(data = practice_mod_overall_list$means_ri_subfield, aes(x = ri_subfield, y = Estimate)) + 
+  geom_point(data = practice_overall_ri_subfield_raw, aes(x = ri_subfield, y = check_sum, colour = ri_subfield), 
+             position = position_jitter(width = practice_overall_ri_subfield_raw$n, height = 0,  seed = 1234), 
+             alpha = 0.05) + 
+  geom_point(size = 2) +
+  geom_errorbar(
+    ymin = practice_mod_overall_list$means_ri_subfield$lower, ymax = practice_mod_overall_list$means_ri_subfield$upper,
+    width = 0.1, 
+    size = .65, 
+  ) + 
+  scale_colour_manual(values = c(mon$m4, mon$m5, mon$m6, mon$m7, mon$m8, mon$m9)) + 
+  labs(x = "\n Psychology subfield", y = "Self-reported practice (0-10) \n") + 
+  coord_cartesian(ylim = c(0, 10)) + 
+  scale_y_continuous(breaks = seq(0, 10, 1)) + 
+  theme_light() + 
+  theme(
+    text = element_text(family = "serif"),
+    legend.position = "none", 
+    panel.grid.major = element_line(colour = "#ededed"), 
+    panel.grid.minor = element_blank()
+    
+  )
+```
+
+
+#### plot: uni_rank_cat
+
+```{r}
+practice_overall_uni_rank_cat_raw <- imp_data_0 %>% 
+  dplyr::select(id, uni_rank_cat, check_sum) %>% 
+  dplyr::filter(!is.na(check_sum), !is.na(uni_rank_cat)) %>% 
+  dplyr::group_by(check_sum, uni_rank_cat) %>% 
+  dplyr::mutate(n = n()/100/4) %>% 
+  dplyr::ungroup() %>% 
+  dplyr::mutate(uni_rank_cat = factor(uni_rank_cat, labels = c("1-200", "201-500", "501-1000", "Not ranked")))
+
+```
+
+
+```{r}
+p_practice_uni_rank_cat <- ggplot2::ggplot(data = practice_mod_overall_list$means_uni_rank, aes(x = uni_rank_cat, y = Estimate)) + 
+  geom_point(data = practice_overall_uni_rank_cat_raw, aes(x = uni_rank_cat, y = check_sum, 
+                                                           colour = uni_rank_cat), 
+             position = position_jitter(width = practice_overall_uni_rank_cat_raw$n, height = 0,  seed = 1234), 
+             alpha = 0.04) + 
+  geom_point(size = 2) +
+  geom_errorbar(
+    ymin = practice_mod_overall_list$means_uni_rank$lower, ymax = practice_mod_overall_list$means_uni_rank$upper,
+    width = 0.1, 
+    size = .65, 
+  ) + 
+  labs(x = "\n uni_rank", y = "Self-reported practice (0-10) \n") + 
+  coord_cartesian(ylim = c(0, 10)) + 
+  scale_y_continuous(breaks = seq(0, 10, 1)) + 
+  scale_colour_manual(values = c(mon$m4, mon$m6, mon$m8, mon$m9)) + 
+  theme_light() + 
+  theme(
+    text = element_text(family = "serif"),
+    legend.position = "none", 
+    panel.grid.major = element_line(colour = "#ededed"), 
+    panel.grid.minor = element_blank()
+    
+  )
+```
+
+#### plot: knowledge
+
+```{r warning = F}
+p_practice_knowledge <- practice_mod_overall_list$means_knowledge %>% 
+  ggplot2::ggplot(., aes(x = tf_overall_mean, y = estimate)) +
+  geom_ribbon(aes(ymin = lower_hpd, ymax = upper_hpd), alpha = 0.2, colour = "white", fill = mon$m9) + 
+  geom_path(colour = mon$m9) + 
+  geom_rect(xmin = 0, xmax = 10, ymin = -5, ymax = -0.05, colour = NA, fill = "#ededed", alpha = 0.05) + 
+  labs(x = "\nOverall knowledge (0-10)", y = "\n") + 
+  coord_cartesian(ylim = c(-5,10)) + 
+  scale_x_continuous(breaks = seq(0, 10, 1)) + 
+  scale_y_continuous(breaks = seq(-5, 10, 2.5)) + 
+  theme_minimal() + 
+  theme(
+    legend.position = "top",
+    panel.grid.major = element_line(colour = "#ededed"), 
+    panel.grid.minor = element_blank(),
+    text = element_text(family = "serif")
+  )
+```
+
+
+```{r warning = F, fig.height=5.5, fig.width=7}
+p_practice_scenario + p_practice_ri_teach + p_practice_ri_subfield + p_practice_knowledge
+```
+
+
+
+### --- 
+
+```{r}
+#backpack <- readRDS("../data/processed_data/backpack_070122.rds")
+```
+
+
+### Normality: sampling distribution
+
+
+```{r}
+practice_mod_norm_sam <- readRDS("../objects/models/practice_mod_norm_sam_040122.rds")
+```
+
+```{r}
+assumption_label = "Normal sampling distribution"
+continuous_predictor = "tf_norm_mean"
+ordinal_practice_mod = practice_mod_norm_sam
+
+practice_mod_norm_sam_list <- generate_summary_objects(practice_mod_norm_sam, assumption_label)
+
+# practice_mod_norm_sam_list$cc_probs <- conditional_c_probs(original_data = imp_data_0, 
+#                                                            ordinal_practice_mod = ordinal_practice_mod, 
+#                                                            continuous_predictor = continuous_predictor, 
+#                                                            assumption_label = assumption_label)
+
+# practice_mod_norm_sam_list$probs$c_probs_tf_norm_sam_mean <- conditional_c_probs_cont(ordinal_practice_mod = ordinal_practice_mod, 
+#                                                                                     continuous_predictor = continuous_predictor, 
+#                                                                                     assumption_label = assumption_label)
+practice_mod_norm_sam_list$probs <- conditional_probs(original_data = imp_data_0, 
+                                                      ordinal_practice_mod = ordinal_practice_mod, 
+                                                      continuous_predictor = continuous_predictor, 
+                                                      assumption_label = assumption_label)
+
+practice_mod_norm_sam_list$probs$probs_tf_norm_sam_mean <- conditional_probs_cont(ordinal_practice_mod = ordinal_practice_mod, 
+                                                                                  continuous_predictor = continuous_predictor, 
+                                                                                  assumption_label = assumption_label)
+
+backpack$practice_mod_norm_sam_list <- practice_mod_norm_sam_list
+```
+
+
+
+
+### Normality: error distribution 
+
+
+```{r}
+practice_mod_norm_err <- readRDS("../objects/models/practice_mod_norm_err_040122.rds")
+```
+
+```{r}
+assumption_label = "Normal errors"
+continuous_predictor = "tf_norm_mean"
+ordinal_practice_mod = practice_mod_norm_err
+
+practice_mod_norm_err_list <- generate_summary_objects(practice_mod_norm_err, assumption_label)
+
+# practice_mod_norm_err_list$cc_probs <- conditional_c_probs(original_data = imp_data_0, 
+#                                                       ordinal_practice_mod = ordinal_practice_mod, 
+#                                                       continuous_predictor = continuous_predictor, 
+#                                                       assumption_label = assumption_label)
+# 
+# practice_mod_norm_err_list$cc_probs$c_probs_tf_norm_err_mean <- conditional_c_probs_cont(ordinal_practice_mod = ordinal_practice_mod, 
+#                                                                                continuous_predictor = continuous_predictor, 
+#                                                                                assumption_label = assumption_label)
+
+practice_mod_norm_err_list$probs <- conditional_probs(original_data = imp_data_0, 
+                                                      ordinal_practice_mod = ordinal_practice_mod, 
+                                                      continuous_predictor = continuous_predictor, 
+                                                      assumption_label = assumption_label)
+
+practice_mod_norm_err_list$probs$probs_tf_norm_err_mean <- conditional_probs_cont(ordinal_practice_mod = ordinal_practice_mod, 
+                                                                                  continuous_predictor = continuous_predictor, 
+                                                                                  assumption_label = assumption_label)
+
+backpack$practice_mod_norm_err_list <- practice_mod_norm_err_list
+```
+
+
+
+### Heteroscedasticity
+
+
+```{r}
+practice_mod_het <- readRDS("../objects/models/practice_mod_het_040122.rds")
+```
+
+```{r}
+assumption_label = "Homoscedasticity"
+continuous_predictor = "tf_het_mean"
+ordinal_practice_mod = practice_mod_het
+
+practice_mod_het_list <- generate_summary_objects(practice_mod_het, assumption_label)
+
+# practice_mod_het_list$cc_probs <- conditional_c_probs(original_data = imp_data_0, 
+#                                                       ordinal_practice_mod = ordinal_practice_mod, 
+#                                                       continuous_predictor = continuous_predictor, 
+#                                                       assumption_label = assumption_label)
+# 
+# practice_mod_het_list$cc_probs$c_probs_tf_het_mean <- conditional_c_probs_cont(ordinal_practice_mod = ordinal_practice_mod, 
+#                                                                                continuous_predictor = continuous_predictor, 
+#                                                                                assumption_label = assumption_label)
+
+practice_mod_het_list$probs <- conditional_probs(original_data = imp_data_0, 
+                                                      ordinal_practice_mod = ordinal_practice_mod, 
+                                                      continuous_predictor = continuous_predictor, 
+                                                      assumption_label = assumption_label)
+
+practice_mod_het_list$probs$probs_tf_het_mean <- conditional_probs_cont(ordinal_practice_mod = ordinal_practice_mod, 
+                                                                                  continuous_predictor = continuous_predictor, 
+                                                                                  assumption_label = assumption_label)
+
+backpack$practice_mod_het_list <- practice_mod_het_list
+```
+
+
+
+### Outliers 
+
+
+```{r}
+practice_mod_out <- readRDS("../objects/models/practice_mod_out_040122.rds")
+```
+
+```{r}
+assumption_label = "Outliers"
+continuous_predictor = "tf_out_inf_mean"
+ordinal_practice_mod = practice_mod_out
+
+practice_mod_out_list <- generate_summary_objects(practice_mod_out, assumption_label)
+
+# practice_mod_out_list$cc_probs <- conditional_c_probs(original_data = imp_data_0, 
+#                                                       ordinal_practice_mod = ordinal_practice_mod, 
+#                                                       continuous_predictor = continuous_predictor, 
+#                                                       assumption_label = assumption_label)
+# 
+# practice_mod_out_list$cc_probs$c_probs_tf_out_mean <- conditional_c_probs_cont(ordinal_practice_mod = ordinal_practice_mod, 
+#                                                                                continuous_predictor = continuous_predictor, 
+#                                                                                assumption_label = assumption_label)
+
+practice_mod_out_list$probs <- conditional_probs(original_data = imp_data_0, 
+                                                      ordinal_practice_mod = ordinal_practice_mod, 
+                                                      continuous_predictor = continuous_predictor, 
+                                                      assumption_label = assumption_label)
+
+practice_mod_out_list$probs$probs_tf_out_mean <- conditional_probs_cont(ordinal_practice_mod = ordinal_practice_mod, 
+                                                                                  continuous_predictor = continuous_predictor, 
+                                                                                  assumption_label = assumption_label)
+backpack$practice_mod_out_list <- practice_mod_out_list
+```
+
+
+
+### Influential cases 
+
+
+```{r}
+practice_mod_inf <- readRDS("../objects/models/practice_mod_inf_040122.rds")
+```
+
+```{r}
+assumption_label = "Influential cases"
+continuous_predictor = "tf_out_inf_mean"
+ordinal_practice_mod = practice_mod_inf
+
+practice_mod_inf_list <- generate_summary_objects(practice_mod_inf, assumption_label)
+
+# practice_mod_inf_list$cc_probs <- conditional_c_probs(original_data = imp_data_0, 
+#                                                       ordinal_practice_mod = ordinal_practice_mod, 
+#                                                       continuous_predictor = continuous_predictor, 
+#                                                       assumption_label = assumption_label)
+# 
+# practice_mod_inf_list$cc_probs$c_probs_tf_inf_mean <- conditional_c_probs_cont(ordinal_practice_mod = ordinal_practice_mod, 
+#                                                                                continuous_predictor = continuous_predictor, 
+#                                                                                assumption_label = assumption_label)
+
+practice_mod_inf_list$probs <- conditional_probs(original_data = imp_data_0, 
+                                                      ordinal_practice_mod = ordinal_practice_mod, 
+                                                      continuous_predictor = continuous_predictor, 
+                                                      assumption_label = assumption_label)
+
+practice_mod_inf_list$probs$probs_tf_inf_mean <- conditional_probs_cont(ordinal_practice_mod = ordinal_practice_mod, 
+                                                                                  continuous_predictor = continuous_predictor, 
+                                                                                  assumption_label = assumption_label)
+
+backpack$practice_mod_inf_list <- practice_mod_inf_list
+```
+
+
+
+### Linearity
+
+
+```{r}
+practice_mod_lin <- readRDS("../objects/models/practice_mod_lin_040122.rds")
+```
+
+```{r}
+assumption_label = "Linearity"
+continuous_predictor = "tf_lin_mean"
+ordinal_practice_mod = practice_mod_lin
+
+practice_mod_lin_list <- generate_summary_objects(practice_mod_lin, assumption_label)
+
+# practice_mod_lin_list$cc_probs <- conditional_c_probs(original_data = imp_data_0, 
+#                                                       ordinal_practice_mod = ordinal_practice_mod, 
+#                                                       continuous_predictor = continuous_predictor, 
+#                                                       assumption_label = assumption_label)
+# 
+# practice_mod_lin_list$cc_probs$c_probs_tf_lin_mean <- conditional_c_probs_cont(ordinal_practice_mod = ordinal_practice_mod, 
+#                                                                                continuous_predictor = continuous_predictor, 
+#                                                                                assumption_label = assumption_label)
+
+practice_mod_lin_list$probs <- conditional_probs(original_data = imp_data_0, 
+                                                      ordinal_practice_mod = ordinal_practice_mod, 
+                                                      continuous_predictor = continuous_predictor, 
+                                                      assumption_label = assumption_label)
+
+practice_mod_lin_list$probs$probs_tf_lin_mean <- conditional_probs_cont(ordinal_practice_mod = ordinal_practice_mod, 
+                                                                                  continuous_predictor = continuous_predictor, 
+                                                                                  assumption_label = assumption_label)
+
+backpack$practice_mod_lin_list <- practice_mod_lin_list
+```
+
+
+
+### Independence
+
+
+```{r}
+practice_mod_ind <- readRDS("../objects/models/practice_mod_ind_040122.rds")
+```
+
+```{r}
+assumption_label = "Independence"
+continuous_predictor = "tf_ind_mean"
+ordinal_practice_mod = practice_mod_ind
+
+practice_mod_ind_list <- generate_summary_objects(practice_mod_ind, assumption_label)
+
+# practice_mod_ind_list$cc_probs <- conditional_c_probs(original_data = imp_data_0, 
+#                                                       ordinal_practice_mod = ordinal_practice_mod, 
+#                                                       continuous_predictor = continuous_predictor, 
+#                                                       assumption_label = assumption_label)
+# 
+# practice_mod_ind_list$cc_probs$c_probs_tf_ind_mean <- conditional_c_probs_cont(ordinal_practice_mod = ordinal_practice_mod, 
+#                                                                                continuous_predictor = continuous_predictor, 
+#                                                                                assumption_label = assumption_label)
+
+practice_mod_ind_list$probs <- conditional_probs(original_data = imp_data_0, 
+                                                      ordinal_practice_mod = ordinal_practice_mod, 
+                                                      continuous_predictor = continuous_predictor, 
+                                                      assumption_label = assumption_label)
+
+practice_mod_ind_list$probs$probs_tf_ind_mean <- conditional_probs_cont(ordinal_practice_mod = ordinal_practice_mod, 
+                                                                                  continuous_predictor = continuous_predictor, 
+                                                                                  assumption_label = assumption_label)
+
+backpack$practice_mod_ind_list <- practice_mod_ind_list
+```
+
+
+
+### --- 
+
+### plots: scenario
+
+```{r}
+practice_probs_scenario <-  rbind.data.frame(
+  practice_mod_norm_sam_list$probs$probs_scenario, 
+  practice_mod_norm_err_list$probs$probs_scenario, 
+  practice_mod_out_list$probs$probs_scenario, 
+  practice_mod_lin_list$probs$probs_scenario, 
+  practice_mod_ind_list$probs$probs_scenario, 
+  practice_mod_het_list$probs$probs_scenario, 
+  practice_mod_inf_list$probs$probs_scenario
+  
+) %>% dplyr::ungroup() %>% 
+  dplyr::mutate(
+    assumption = case_when(
+      assumption == "Normal sampling distribution" ~ "Normal \nsampling \ndistribution", 
+      assumption == "Normal errors" ~ "Normal \nerrors", 
+      assumption == "Influential cases" ~ "Influential \ncases", 
+      TRUE ~ assumption
+    ), 
+    scenario = factor(scenario, labels = c("Experimental", "Cross-sectional")),
+    .category = factor(.category, labels = c("1", 
+                                             "2", 
+                                             "3"))
+  ) %>% dplyr::arrange(assumption)
+
+
+```
+
+
+```{r fig.width = 8.25, fig.height=3.5}
+dodge_width = 0.3
+ggplot2::ggplot(data = practice_probs_scenario, aes(x = .category, y = estimate, colour = scenario)) + 
+  #geom_path(position = position_dodge(width = dodge_width), alpha = 0.5) +
+  geom_errorbar(aes(ymin = lower_hpd, ymax = upper_hpd),
+                width = 0.2, size = .65, position = position_dodge(width = dodge_width)) + 
+  geom_point(position = position_dodge(width = dodge_width)) +
+  facet_wrap(~assumption, ncol = 7) + 
+  labs(x = "\nPractice category", y = "Probability\n", colour = "Scenario") + 
+  coord_cartesian(ylim = c(0,1)) + 
+  scale_y_continuous(breaks = seq(0, 1, 0.1), minor_breaks = seq(0.1, 0.9, 0.2)) + 
+  scale_colour_manual(values = c(mon$m5, mon$m9)) + 
+  theme_light() + 
+  theme(
+    legend.position = "top", 
+    text = element_text(family = "serif"),
+  ) #+ 
+# guides(colour = guide_legend(title.position = "top", title.hjust = 0.5))
+```
+
+### plots: ri_teach
+
+```{r}
+practice_probs_ri_teach <-  rbind.data.frame(
+  practice_mod_norm_sam_list$probs$probs_ri_teach, 
+  practice_mod_norm_err_list$probs$probs_ri_teach, 
+  practice_mod_out_list$probs$probs_ri_teach, 
+  practice_mod_lin_list$probs$probs_ri_teach, 
+  practice_mod_ind_list$probs$probs_ri_teach, 
+  practice_mod_het_list$probs$probs_ri_teach, 
+  practice_mod_inf_list$probs$probs_ri_teach
+  
+) %>% dplyr::ungroup() %>% 
+  dplyr::mutate(
+    assumption = case_when(
+      assumption == "Normal sampling distribution" ~ "Normal \nsampling \ndistribution", 
+      assumption == "Normal errors" ~ "Normal \nerrors", 
+      assumption == "Influential cases" ~ "Influential \ncases", 
+      TRUE ~ assumption
+    ), 
+    ri_teach = factor(ri_teach, labels = c("Yes", "No")),
+    .category = factor(.category, labels = c("1", "2", "3"))
+  ) %>% dplyr::arrange(assumption)
+
+```
+
+
+```{r fig.width = 8.25, fig.height=3.5}
+dodge_width = 0.3
+ggplot2::ggplot(data = practice_probs_ri_teach, aes(x = .category, y = estimate, colour = ri_teach)) + 
+  #geom_path(position = position_dodge(width = dodge_width), alpha = 0.5) +
+  geom_errorbar(aes(ymin = lower_hpd, ymax = upper_hpd),
+                width = 0.2, size = .65, position = position_dodge(width = dodge_width)) + 
+  geom_point(position = position_dodge(width = dodge_width)) +
+  facet_wrap(~assumption, ncol = 7) + 
+  labs(x = "\nPractice category", y = "Probability\n", colour = "Research methods teaching") + 
+  coord_cartesian(ylim = c(0,1)) + 
+  scale_y_continuous(breaks = seq(0, 1, 0.1), minor_breaks = seq(0.1, 0.9, 0.2)) + 
+  scale_colour_manual(values = c(mon$m5, mon$m9)) + 
+  theme_light() + 
+  theme(
+    legend.position = "top", 
+    text = element_text(family = "serif"),
+  )# + 
+# guides(colour = guide_legend(title.position = "top", title.hjust = 0.5))
+```
+
+### plots: ri_subfield
+
+```{r}
+practice_probs_ri_subfield <-  rbind.data.frame(
+  practice_mod_norm_sam_list$probs$probs_ri_subfield, 
+  practice_mod_norm_err_list$probs$probs_ri_subfield, 
+  practice_mod_out_list$probs$probs_ri_subfield, 
+  practice_mod_lin_list$probs$probs_ri_subfield, 
+  practice_mod_ind_list$probs$probs_ri_subfield, 
+  practice_mod_het_list$probs$probs_ri_subfield, 
+  practice_mod_inf_list$probs$probs_ri_subfield
+  
+) %>% dplyr::ungroup() %>% 
+  dplyr::mutate(
+    assumption = case_when(
+      assumption == "Normal sampling distribution" ~ "Normal \nsampling \ndistribution", 
+      assumption == "Normal errors" ~ "Normal \nerrors", 
+      assumption == "Influential cases" ~ "Influential \ncases", 
+      TRUE ~ assumption
+    ), 
+    ri_subfield = factor(ri_subfield) %>% forcats::fct_relevel(., "Methods", after = 0L),
+    .category = factor(.category, labels = c("1", "2", "3"))
+  ) %>% dplyr::arrange(assumption, ri_subfield)
+
+```
+
+
+```{r fig.width = 8.25, fig.height=3.5}
+dodge_width = 0.8
+ggplot2::ggplot(data = practice_probs_ri_subfield, aes(x = .category, y = estimate, colour = ri_subfield)) + 
+  #geom_path(position = position_dodge(width = dodge_width), alpha = 0.5) +
+  geom_errorbar(aes(ymin = lower_hpd, ymax = upper_hpd),
+                width = 0.2, size = .65, position = position_dodge(width = dodge_width)) + 
+  geom_point(position = position_dodge(width = dodge_width)) +
+  facet_wrap(~assumption, ncol = 7) + 
+  labs(x = "\nPractice category", y = "Probability\n", colour = "Psychology subfield") + 
+  coord_cartesian(ylim = c(0,1)) + 
+  scale_y_continuous(breaks = seq(0, 1, 0.1), minor_breaks = seq(0.1, 0.9, 0.2)) + 
+  scale_colour_manual(values = c(mon$m9, mon$m8, mon$m7, mon$m6, mon$m5, mon$m4)) + 
+  theme_light() + 
+  theme(
+    legend.position = "top", 
+    text = element_text(family = "serif"),
+  ) + 
+ guides(colour = guide_legend(title.position = "top", title.hjust = 0.5, nrow = 1))
+```
+
+### plots: uni_rank_cat
+
+```{r}
+practice_probs_uni_rank_cat <-  rbind.data.frame(
+  practice_mod_norm_sam_list$probs$probs_uni_rank_cat, 
+  practice_mod_norm_err_list$probs$probs_uni_rank_cat, 
+  practice_mod_out_list$probs$probs_uni_rank_cat, 
+  practice_mod_lin_list$probs$probs_uni_rank_cat, 
+  practice_mod_ind_list$probs$probs_uni_rank_cat, 
+  practice_mod_het_list$probs$probs_uni_rank_cat, 
+  practice_mod_inf_list$probs$probs_uni_rank_cat
+  
+) %>% dplyr::ungroup() %>% 
+  dplyr::mutate(
+    assumption = case_when(
+      assumption == "Normal sampling distribution" ~ "Normal \nsampling \ndistribution", 
+      assumption == "Normal errors" ~ "Normal \nerrors", 
+      assumption == "Influential cases" ~ "Influential \ncases", 
+      TRUE ~ assumption
+    ), 
+    uni_rank_cat = factor(uni_rank_cat, labels = c("1-200", "201-500", "501-1000", "Not ranked")),
+    .category = factor(.category, labels = c("1", "2", "3"))
+  ) %>% dplyr::arrange(assumption, uni_rank_cat)
+
+```
+
+
+```{r fig.width = 8.25, fig.height=3.5}
+dodge_width = 0.8
+ggplot2::ggplot(data = practice_probs_uni_rank_cat, aes(x = .category, y = estimate, colour = uni_rank_cat)) + 
+  #geom_path(position = position_dodge(width = dodge_width), alpha = 0.5) +
+  geom_errorbar(aes(ymin = lower_hpd, ymax = upper_hpd),
+                width = 0.2, size = .65, position = position_dodge(width = dodge_width)) + 
+  geom_point(position = position_dodge(width = dodge_width)) +
+  facet_wrap(~assumption, ncol = 7) + 
+  labs(x = "\nPractice category", y = "Probability\n", colour = "Research methods teaching") + 
+  coord_cartesian(ylim = c(0,1)) + 
+  scale_y_continuous(breaks = seq(0, 1, 0.1), minor_breaks = seq(0.1, 0.9, 0.2)) + 
+  scale_colour_manual(values = c(mon$m9, mon$m8, mon$m7, mon$m6, mon$m5, mon$m4)) + 
+  theme_light() + 
+  theme(
+    legend.position = "top", 
+    text = element_text(family = "serif"),
+  ) + 
+ guides(colour = guide_legend(title.position = "top", title.hjust = 0.5, nrow = 1))
+```
+
+### plots: continuous predictor
+
+```{r}
+practice_probs_continuous <- 
+  rbind.data.frame(
+    practice_mod_norm_sam_list$probs$probs_tf_norm_sam_mean, 
+    practice_mod_norm_err_list$probs$probs_tf_norm_err_mean,
+    practice_mod_het_list$probs$probs_tf_het_mean,
+    practice_mod_out_list$probs$probs_tf_out_mean,
+    practice_mod_inf_list$probs$probs_tf_inf_mean,
+    practice_mod_lin_list$probs$probs_tf_lin_mean,
+    practice_mod_ind_list$probs$probs_tf_ind_mean
+  ) %>% dplyr::ungroup() %>% 
+  dplyr::mutate(
+    assumption = case_when(
+      assumption == "Normal sampling distribution" ~ "Normal \nsampling \ndistribution", 
+      assumption == "Normal errors" ~ "Normal \nerrors", 
+      assumption == "Influential cases" ~ "Influential \ncases", 
+      TRUE ~ assumption
+    ), 
+    .category = factor(.category, labels = c("1", "2", "3"))
+  )
+
+```
+
+
+```{r fig.width=8.3, fig.height=3.5}
+practice_probs_continuous %>% 
+  ggplot2::ggplot(., aes(x = continuous_predictor, y = estimate, colour = .category, group = .category, fill = .category)) + 
+  geom_ribbon(aes(ymin = lower_hpd, ymax = upper_hpd), alpha = 0.2, colour = NA) + 
+  geom_path() + 
+  labs(x = "\nKnowledge of assumption (0-10)", y = "Probability\n", colour = "Practice category", fill = "Practice category") + 
+  scale_x_continuous(breaks = seq(0, 10, 2)) + 
+  scale_colour_manual(values = c(mon$m9, mon$m7, mon$m5)) + 
+  scale_fill_manual(values = c(mon$m9, mon$m7, mon$m5)) + 
+  facet_wrap(~assumption, ncol = 7) + 
+  theme_light() + 
+  theme(
+    legend.position = "top",
+    panel.grid.major = element_line(colour = "#ededed"), 
+    panel.grid.minor = element_blank(),
+    text = element_text(family = "serif")
+  )
+```
+
+
+### ---
+
+## TF models
+
+
+
+```{r}
+# 1. read everything
+# 
+setwd("../objects/models/tf_models")
+files = list.files(pattern = "*.rds")
+tf_models_list <- purrr::map(.x = files, ~readRDS(.))
+
+model_names <- files %>% stringr::str_remove_all(., "_mod_120122.rds")
+
+# 2. apply function to get estimates 
+
+tf_models_post_list <- NULL
+for (i in 1:length(tf_models_list)) {
+  df_i = tf_posterior_draws(tf_models_list[[i]]) %>%
+    dplyr::mutate(model = model_names[i])
+  tf_models_post_list[[i]] = df_i
+}
+
+
+# 3. convert into data frame 
+
+tf_models_df <- do.call(rbind.data.frame, tf_models_post_list)
+```
+
+```{r}
+backpack$tf_models_df = tf_models_df
+```
+
+```{r}
+#saveRDS(backpack, "../data/processed_data/backpack_070122.rds")
+```
+
+### --- 
+
+## Reasons for not checking assumptions 
+
+```{r}
+n_check_data <- read.csv("../data/processed_data/n_check_recoded_for_analysis.csv", encoding = "UTF-8")
+```
+
+```{r}
+n_check_data %<>% 
+  dplyr::select(id, scenario, L1_recoded:L7_recoded) %>% 
+  tidyr::pivot_longer(cols = c(-id, -scenario), names_to = "assumption", values_to = "reason") %>% 
+  dplyr::group_by(scenario, assumption, reason) %>% 
+  dplyr::summarise(n = n()) %>% 
+  dplyr::group_by(scenario, assumption) %>% 
+  dplyr::mutate(percent = round(n/sum(n)*100, 2)) %>% 
+  dplyr::ungroup() %>% 
+  dplyr::filter(!is.na(reason), !reason %in% c("Checks and corrects violations", "")) %>% 
+  dplyr::mutate(
+    assumption = factor(assumption, 
+                        labels = c("Linearity", "Independence", "Outliers", "Influential\ncases", 
+                                   "Homoscedasticity", "Normal\nsampling\ndistribution", 
+                                   "Normal\nerrors"))
+  ) %>% dplyr::ungroup()
+ 
+n_check_sum <- n_check_data %>% 
+  dplyr::mutate(
+    reason = tidytext::reorder_within(reason, percent, scenario)
+  )
+
+n_check_group_split <- n_check_data %>%
+  dplyr::mutate(reason = tidytext::reorder_within(reason, percent, assumption)) %>% 
+  dplyr::group_by(assumption) %>% 
+  dplyr::group_split()
+
+
+```
+
+
+```{r fig.width=5, fig.height=3}
+reasons_plot <- function(data, position = "bottom"){
+  ggplot2::ggplot(data = data ,aes(y = percent, x = reason, 
+                                             colour = scenario, fill = scenario)) + 
+  geom_col(position = position_dodge(width = 0.6), width = 0.4) + 
+  facet_wrap(~assumption, scales = "free_y", ncol = 1) +
+  scale_colour_manual(values = c(mon$m5, mon$m9)) + 
+  scale_fill_manual(values = c(mon$m5, mon$m9)) + 
+  coord_flip(ylim = c(0, 100)) +
+  tidytext::scale_x_reordered(position = position) +
+  labs(x = "", y = "", colour = "", fill = "") + 
+  theme_minimal() + 
+  theme(
+    legend.position = "none", 
+    text = element_text(family = "serif")
+  )
+}
+
+data = n_check_group_split
+
+p_reasons_ind <- reasons_plot(data = data[[2]])
+p_reasons_het <- reasons_plot(data = data[[5]], position = "top")
+
+p_reasons_out <- reasons_plot(data = data[[3]])
+p_reasons_inf <- reasons_plot(data = data[[4]], position = "top")
+
+p_reasons_norm_sam <- reasons_plot(data = data[[6]])
+p_reasons_norm_err <- reasons_plot(data = data[[7]], position = "top")
+
+p_reasons_lin <- reasons_plot(data = data[[1]])
+```
+
+
+```{r fig.width=10, fig.height=10}
+layout <- "
+AB
+CD
+EF
+G#
+"
+# 
+# ((p_knowledge_ri_teach + p_knowledge_ri_subfield) +  x_label) + 
+#   plot_layout(design = layout, heights = c(9,1))
+
+
+(p_reasons_ind + p_reasons_het + p_reasons_out + p_reasons_inf + p_reasons_norm_sam + p_reasons_norm_err + p_reasons_lin) + 
+  plot_layout(design = layout)
+```
+
+```{r}
+shades = data.frame(
+  keep = rep(c(1,0), 9),  
+  xmin = seq(.5, 17.5, 1)
+) %>% 
+  dplyr::mutate(xmax = xmin + 1) %>% 
+  dplyr::filter(keep == 1)
+```
+
+```{r fig.height=6, fig.width=6} 
+plt <- ggplot2::ggplot(data = n_check_sum %>% dplyr::filter(scenario == "s1"),aes(y = percent, x = reason, 
+                                        colour = assumption, fill = assumption)) 
+  
+  for(i in 1:nrow(shades)){
+    plt = plt + 
+    geom_rect(xmin = shades$xmin[i], xmax = shades$xmax[i], ymin = 0, ymax = 100, colour = NA, fill = "#ededed", alpha = 0.4) 
+  }
+  
+  plt + 
+  geom_col(position = position_dodge(width = 1), width = .5) + 
+  facet_wrap(~scenario, scales = "free_y", ncol = 1) +
+  scale_colour_manual(values = c(mon$m3, mon$m4, mon$m5, mon$m6, mon$m7, mon$m8, mon$m9)) + 
+  scale_fill_manual(values = c(mon$m3, mon$m4, mon$m5, mon$m6, mon$m7, mon$m8, mon$m9)) + 
+  coord_flip(ylim = c(0, 100)) +
+  tidytext::scale_x_reordered() +
+  labs(x = "", y = "", colour = "", fill = "") + 
+  
+  theme_minimal() + 
+  theme(
+    legend.position = "none", 
+    text = element_text(family = "serif")
+  )
+```
+
+let's try instead...
+
+```{r}
+#backpack <- readRDS("../data/processed_data/backpack_070122.rds")
+```
+
+
+```{r}
+n_check_data <- read.csv("../data/processed_data/n_check_recoded_for_analysis.csv", encoding = "UTF-8")
+```
+
+
+```{r}
+n_check_reasons_to_sum <- c(
+  "Missing", 
+  "Other reasons",
+  "The assumption is not important",
+  "The analysis will be robust even under violations",
+  "Lack of familiarity with the assumption or methods", 
+  "Assumption not relevant given the context"
+)
+
+n_check_sum <- n_check_data %>% 
+  dplyr::select(id, scenario, L1_recoded:L7_recoded) %>% 
+  tidyr::pivot_longer(cols = c(-id, -scenario), names_to = "assumption", values_to = "reason") %>% 
+  dplyr::filter(!reason %in% c("Checks and corrects violations", "")) %>% 
+  dplyr::mutate(
+    assumption = factor(assumption, 
+                        labels = c("Linearity", "Independence", "Outliers", "Influential\ncases", 
+                                   "Homoscedasticity", "Normal sampling\ndistribution", 
+                                   "Normal errors")), 
+    reason = if_else(is.na(reason), "Missing", reason), 
+    reason = if_else(reason %in% n_check_reasons_to_sum, reason, "Other reasons")
+  ) %>% 
+  dplyr::group_by(scenario, assumption, reason) %>% 
+  dplyr::summarise(n = n()) %>% 
+  dplyr::ungroup() %>%
+  dplyr::mutate(
+    reason = factor(reason, levels = n_check_reasons_to_sum), 
+    scenario = factor(scenario, labels = c("Experimental", "Cross-sectional"))) %>%
+  dplyr::group_by(scenario) %>% 
+  dplyr::group_split()
+
+#### s1
+
+n_check_sum_s1 <- n_check_sum[[1]] %>% 
+  dplyr::group_by(assumption) %>% 
+  dplyr::mutate(percent = n/sum(n)*100) 
+  
+s1_n_check_list <- n_check_sum_s1 %>% 
+  dplyr::group_by(reason) %>%
+  dplyr::arrange(percent) %>%
+  dplyr::group_split()
+
+s1_n_check_levels <- s1_n_check_list[[6]]$assumption
+
+n_check_sum_s1 %<>% 
+  dplyr::mutate(assumption = factor(assumption, levels = s1_n_check_levels))
+
+#### s2
+
+n_check_sum_s2 <- n_check_sum[[2]] %>% 
+  dplyr::group_by(assumption) %>% 
+  dplyr::mutate(percent = n/sum(n)*100) 
+  
+s2_n_check_list <- n_check_sum_s2 %>% 
+  dplyr::group_by(reason) %>%
+  dplyr::arrange(percent) %>%
+  dplyr::group_split()
+
+s2_n_check_levels <- s2_n_check_list[[6]]$assumption
+
+n_check_sum_s2 %<>% 
+  dplyr::mutate(assumption = factor(assumption, levels = s2_n_check_levels))
+
+```
+
+```{r}
+s1_n_check_plot <- n_check_sum_s1 %>%
+  ggplot2::ggplot(., aes(x = percent, y = assumption, fill = reason)) + 
+  geom_col(width = 0.9, colour = NA) + 
+  labs(x = "", y = "", fill = "") + 
+  scale_fill_manual(values = rev(c(mon$m4, mon$m5, mon$m6, mon$m7, mon$m8, mon$m9))) + 
+  facet_wrap(~scenario) + 
+  theme_minimal() + 
+  theme(
+    legend.position = "none",
+    text = element_text(family = "serif")
+  ) + guides(fill = guide_legend(title.position = "top", title.hjust = 0.5, nrow = 3, label.position = "right"))
+```
+
+
+```{r}
+s2_n_check_plot <- n_check_sum_s2 %>%
+  ggplot2::ggplot(., aes(x = percent, y = assumption, fill = reason)) + 
+  geom_col(width = 0.9, colour = NA) + 
+  labs(x = "", y = "", fill = "") + 
+  scale_fill_manual(values = rev(c(mon$m4, mon$m5, mon$m6, mon$m7, mon$m8, mon$m9))) + 
+  scale_y_discrete(position = "right") + 
+  facet_wrap(~scenario) + 
+  theme_minimal() + 
+  theme(
+    legend.position = "none",
+    text = element_text(family = "serif")
+  ) + guides(fill = guide_legend(title.position = "top", title.hjust = 0.5, nrow = 3, label.position = "left"))
+```
+
+
+```{r}
+legend_plot <- ggplot(n_check_sum_s1, aes(x = percent, y = assumption, fill = factor(reason, levels = rev(n_check_reasons_to_sum)))) +   
+  geom_col(color = NA) + 
+  scale_fill_manual(values = (c(mon$m4, mon$m5, mon$m6, mon$m7, mon$m8, mon$m9))) +
+  coord_cartesian(xlim = c(0,0), ylim = c(-5,-2)) + 
+  labs(fill = "Reasons for not attending to assumption \n") + 
+  theme_void() +
+  theme(
+    legend.position = "top",
+    text = element_text(family = "serif")
+  ) + guides(fill = guide_legend(title.position = "top", title.hjust = 0.5, nrow = 3, label.position = "right"))
+
+
+x_label <- ggplot2::ggplot(data = data.frame(y = rep(1, 10), x = 1:10)) + 
+  annotate("text", x = 5, y = 1, label = "Percent (%)", family = "serif") + 
+  theme_void() 
+```
+
+```{r}
+layout <- "
+#CCCCCCCCCCC
+AAAAAABBBBBB
+DDDDDDDDDDDD
+"
+
+
+
+(s1_n_check_plot + s2_n_check_plot + legend_plot + x_label) + 
+  plot_layout(design = layout, heights = c(1,9))
+
+```
+
+## Use of methods 
+
+```{r}
+methods_use <- read.csv("../data/processed_data/methods_use_processed.csv", encoding = "UTF-8") 
+
+methods_use %<>%
+  dplyr::mutate(
+    n_use_reason_general_code = if_else(is.na(n_use_reason_general_code), "Missing", n_use_reason_general_code), 
+    use = case_when(
+      is.na(use) ~ "Missing", 
+      use %in% c("I've heard of this method,  but I never use it.", 
+                 "I've heard of this methods and I sometimes use it.") ~ "Method used rarely or never", 
+      use == "I've heard of this method  and I regularly use it." ~ "Method used regularly", 
+      use == "I've never heard  of this method." ~ "Never heard of the method",
+      TRUE ~ use
+      ), 
+    use = factor(use) %>% 
+     forcats::fct_relevel(., "Never heard of the method", after = 2L) %>%
+      forcats::fct_relevel(., "Method used regularly", after = 0L) %>% 
+      forcats::fct_rev()
+    )
+
+```
+
+```{r}
+methods_use_sum <- methods_use %>%
+  dplyr::group_by(method, use) %>%
+  dplyr::summarise(n = n()) %>%
+  dplyr::mutate(
+    percent = n/(nrow(methods_use)/23)*100
+    ) %>%
+  dplyr::group_by(use) %>%
+  dplyr::arrange(use, desc(n))
+
+methods_use_list <- methods_use_sum %>% 
+  dplyr::group_split()
+
+method_levels = methods_use_list[[4]]$method 
+
+methods_use_sum %<>%
+  dplyr::mutate(method = factor(method, levels = method_levels))
+
+```
+
+```{r fig.height=5, fig.width=7}
+method_use_freq_p <- methods_use_sum %>%
+  ggplot2::ggplot(., aes(x = percent, y = method, fill = use)) + 
+  geom_col(width = 0.9, colour = NA) + 
+  labs(x = "\nPercent (%)", y = "", fill = "Frequency of method use\n") + 
+  scale_fill_manual(values = rev(c(mon$m4, mon$m6, mon$m7, mon$m8))) + 
+  theme_minimal() + 
+  theme(
+    legend.position = "none",
+    text = element_text(family = "serif")
+  ) + guides(fill = guide_legend(title.position = "top", title.hjust = 0.5, nrow = 2, label.position = "right"))
+
+method_use_legend_p <- methods_use_sum %>%
+  ggplot2::ggplot(., aes(x = percent, y = method, fill = factor(use, levels = rev(levels(methods_use$use))))) + 
+  geom_col(colour = NA) +
+  scale_fill_manual(values = (c(mon$m4, mon$m6, mon$m7, mon$m8))) +
+  coord_cartesian(xlim = c(-0,-0), ylim = c(-2,-1))+
+  labs(fill = "Frequency of method use \n") + 
+  theme_void() + 
+  theme(
+    legend.position = "top",
+    text = element_text(family = "serif")
+  ) + guides(fill = guide_legend(title.position = "top", title.hjust = 0.5, nrow = 2, label.position = "right"))
+
+
+layout <- "
+B
+A
+"
+
+
+(method_use_freq_p + method_use_legend_p) + 
+  plot_layout(design = layout, heights = c(1,9))
+
+```
+
+```{r}
+reasons_to_sum <- c(
+  "Missing", 
+  "Other reasons",
+  "Concerns about publishing", 
+  "Analysis software limitations", 
+  "The method is not reliable or appropriate",
+  "Unsure how to apply the method"
+)
+
+methods_n_use_sum <- 
+  methods_use %>% 
+  dplyr::filter(!is.na(n_use_reason)) %>% 
+  dplyr::mutate(
+    n_use_reason_general_code = if_else(n_use_reason_general_code == "Using this method  would make it  more difficult  to get work  published",
+                                        "Concerns about publishing", n_use_reason_general_code), 
+    n_use_reason_general_code = if_else(n_use_reason_general_code == "Reseacher’s primary software cannot perform the analysis",
+                                        "Analysis software limitations", n_use_reason_general_code), 
+    n_use_reason_general_code = if_else(n_use_reason_general_code %in% reasons_to_sum, n_use_reason_general_code, "Other reasons"), 
+  ) %>% 
+  dplyr::group_by(method, n_use_reason_general_code) %>% 
+  dplyr::summarise(n = n()) %>% 
+  dplyr::group_by(method) %>% 
+  dplyr::mutate(
+    percent = n/sum(n)*100, 
+    n_use_reason_general_code = factor(n_use_reason_general_code, levels = reasons_to_sum)) %>% 
+  dplyr::arrange(method, desc(n)) 
+
+methods_n_use_list <- methods_n_use_sum %>% 
+  dplyr::arrange(desc(percent)) %>% 
+  dplyr::group_by(n_use_reason_general_code) %>% 
+  dplyr::group_split()
+
+
+method_n_use_levels <- methods_n_use_list[[6]]$method
+
+methods_n_use_sum %<>% 
+  dplyr::mutate(method = factor(method, levels = method_n_use_levels))
+
+```
+
+```{r}
+methods_n_use_p <- methods_n_use_sum %>%
+  ggplot2::ggplot(., aes(x = percent, y = method, fill = n_use_reason_general_code)) + 
+  geom_col(width = 0.9, colour = NA) + 
+  labs(x = "\nPercent (%)", y = "", fill = "Reason for not using a method\n") + 
+  scale_fill_manual(values = rev(c(mon$m4, mon$m5, mon$m6, mon$m7, mon$m8, mon$m9))) + 
+  theme_minimal() + 
+  theme(
+    legend.position = "none",
+    text = element_text(family = "serif")
+  ) + guides(fill = guide_legend(title.position = "top", title.hjust = 0.5, nrow = 3, label.position = "right"))
+
+
+methods_n_use_legend <- methods_n_use_sum %>%
+  ggplot2::ggplot(., aes(x = percent, y = method, fill = factor(n_use_reason_general_code, 
+                                                                levels = rev(levels(methods_n_use_sum$n_use_reason_general_code))))) + 
+  geom_col(width = 0.9, colour = NA) + 
+  labs(x = "", y = "", fill = "Reason for not using a method\n") + 
+  scale_fill_manual(values = (c(mon$m4, mon$m5, mon$m6, mon$m7, mon$m8, mon$m9))) + 
+  coord_cartesian(xlim = c(0,0), y = c(-1,-1)) + 
+  theme_void() + 
+  theme(
+    legend.position = "top",
+    text = element_text(family = "serif")
+  ) + guides(fill = guide_legend(title.position = "top", title.hjust = 0.5, nrow = 3, label.position = "right"))
+```
+
+
+```{r fig.height=5, fig.width=7}
+layout <- "
+BBBBBBB#
+AAAAAAAA
+"
+
+(methods_n_use_p + methods_n_use_legend) + 
+  plot_layout(design = layout, heights = c(.5,9))
+```
+
+```{r}
+#saveRDS(backpack, "../data/processed_data/backpack_020222.rds")
+```
+

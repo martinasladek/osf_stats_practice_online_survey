@@ -1,0 +1,408 @@
+---
+title: "Data analysis: Statistical models"
+author: "MS"
+date: "22/09/2021"
+output: html_document
+---
+
+IMPORTANT: The original dataset collected information about university name which was then paired with a world rank. Both of these variables could be used to identify participants at institutions which, at the time, did not tie on ranks with any other institutions. Because of this, the variables were removed from the dataset. 
+
+The variable `world_rank` was replaced with a randomly generated variable that correlated with the original rank with r = 0.9. Therefore the code below will still be able to run, however please note that any computations that use `world_rank` will not be exactly reproducible. 
+
+The main analysis in the file `analysis_models.Rmd` uses the actual data that was used to fit the models reported in the manuscript. The statistical models used a categorical version of the variable (`world_rank` split into 4 levels), which doesn't pose risk of de-identification and was therefore retained. Basically, the statistical models `analysis_models.Rmd` can be reproduced exactly, but not the imputation. 
+
+```{r setup, include=TRUE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(brms)
+library(dplyr)
+library(ggplot2)
+library(magrittr)
+library(mice)
+
+imp_data_list <- readRDS("../data/processed_data/imputed_data_1-n_040122_world_rank_removed.rds")
+
+# get scenario 1 only for knowledge models 
+imp_data_list_s1 <- purrr::map(imp_data_list, ~dplyr::filter(.x, scenario == "s1"))
+```
+
+# Models
+
+## Knowledge models 
+
+#### overall
+
+```{r}
+knowledge_mod_overall <- brms::brm_multiple(
+  tf_overall_mean ~ 1 + ri_teach + ri_subfield + uni_rank_cat, 
+  data = imp_data_list_s1, 
+  family = "student", 
+  cores = 4, 
+  seed = 040122
+)
+
+saveRDS(knowledge_mod_overall, "../objects/models/knowledge_mod_overall_040122.rds")
+
+```
+
+```{r}
+summary(knowledge_mod_overall)
+```
+
+```{r}
+brms::conditional_effects(knowledge_mod_overall)
+```
+
+#### normality 
+
+```{r}
+knowledge_mod_norm <- brms::brm_multiple(
+  tf_norm_mean ~ 1 + ri_teach + ri_subfield + uni_rank_cat, 
+  data = imp_data_list_s1, 
+  family = "student", 
+  cores = 4, 
+  seed = 040122
+)
+
+saveRDS(knowledge_mod_norm, "../objects/models/knowledge_mod_norm_040122.rds")
+
+```
+
+```{r}
+summary(knowledge_mod_norm)
+```
+
+```{r}
+brms::conditional_effects(knowledge_mod_norm)
+```
+
+#### heteroscedasticity 
+
+```{r}
+knowledge_mod_het <- brms::brm_multiple(
+  tf_het_mean ~ 1 + ri_teach + ri_subfield + uni_rank_cat, 
+  data = imp_data_list_s1, 
+  family = "student", 
+  cores = 4, 
+  seed = 040122
+)
+
+saveRDS(knowledge_mod_het, "../objects/models/knowledge_mod_het_040122.rds")
+
+```
+
+```{r}
+summary(knowledge_mod_het)
+```
+
+```{r}
+brms::conditional_effects(knowledge_mod_het)
+```
+
+#### outliers and inf cases 
+
+```{r}
+knowledge_mod_out_inf <- brms::brm_multiple(
+  tf_out_inf_mean ~ 1 + ri_teach + ri_subfield + uni_rank_cat, 
+  data = imp_data_list_s1, 
+  family = "student", 
+  cores = 4, 
+  seed = 040122
+)
+
+saveRDS(knowledge_mod_out_inf, "../objects/models/knowledge_mod_out_inf_040122.rds")
+
+```
+
+```{r}
+summary(knowledge_mod_out_inf)
+```
+
+```{r}
+brms::conditional_effects(knowledge_mod_out_inf)
+```
+
+
+#### linearity
+
+```{r}
+knowledge_mod_lin <- brms::brm_multiple(
+  tf_lin_mean ~ 1 + ri_teach + ri_subfield + uni_rank_cat, 
+  data = imp_data_list_s1, 
+  family = "student", 
+  cores = 4, 
+  seed = 040122
+)
+
+saveRDS(knowledge_mod_lin, "../objects/models/knowledge_mod_lin_040122.rds")
+
+```
+
+```{r}
+summary(knowledge_mod_lin)
+```
+
+```{r}
+brms::conditional_effects(knowledge_mod_lin)
+```
+
+#### independence
+
+```{r}
+knowledge_mod_ind <- brms::brm_multiple(
+  tf_ind_mean ~ 1 + ri_teach + ri_subfield + uni_rank_cat, 
+  data = imp_data_list_s1, 
+  family = "student", 
+  cores = 4, 
+  seed = 040122
+)
+
+saveRDS(knowledge_mod_ind, "../objects/models/knowledge_mod_ind_040122.rds")
+
+```
+
+```{r}
+summary(knowledge_mod_ind)
+```
+
+```{r}
+brms::conditional_effects(knowledge_mod_ind)
+```
+
+## Practice models 
+
+!! When you get to this part, run a single model first to check sampling issues. 
+
+https://mc-stan.org/misc/warnings.html
+
+```{r}
+practice_test_model_overall <- brms::brm(
+  check_sum ~ 1 + scenario + tf_overall_mean + ri_teach + ri_subfield + uni_rank_cat + 
+    (1|id),
+  data = imp_data_list[[1]], 
+  family = "student", 
+  cores = 4, 
+  seed = 040122
+)
+
+practice_test_model
+```
+
+```{r}
+practice_test_model_overall_norm_sam <- brms::brm(
+  check_num_norm_sam ~ 1 + scenario + tf_norm_mean + ri_teach + ri_subfield + uni_rank_cat + 
+    (1|id),
+  data = imp_data_list[[1]], 
+  family = cumulative("probit"), 
+  cores = 4, 
+  seed = 040122
+)
+
+practice_test_model_overall_norm_sam
+```
+
+
+#### overall
+
+scenario was causing sampling problems so random effects not modeled. 
+
+```{r}
+practice_mod_overall <- brms::brm_multiple(
+  check_sum ~ 1 + scenario + tf_overall_mean + ri_teach + ri_subfield + uni_rank_cat + 
+    (1|id),
+  data = imp_data_list, 
+  family = "student", 
+  cores = 4, 
+  seed = 040122
+)
+
+saveRDS(practice_mod_overall, "../objects/models/practice_mod_overall_040122.rds")
+```
+
+```{r}
+summary(practice_mod_overall)
+```
+
+```{r}
+#practice_mod_overall <- readRDS("../objects/models/practice_mod_overall_040122.rds")
+brms::conditional_effects(practice_mod_overall)
+```
+
+
+
+#### normality: sampling distribution
+
+```{r}
+practice_mod_norm_sam <- brms::brm_multiple(
+  check_num_norm_sam ~ 1 + scenario + tf_norm_mean + ri_teach + ri_subfield + uni_rank_cat + 
+    (1|id),
+  data = imp_data_list, 
+  family = cumulative("probit"), 
+  cores = 4, 
+  seed = 040122
+)
+
+saveRDS(practice_mod_norm_sam, "../objects/models/practice_mod_norm_sam_040122.rds")
+```
+
+```{r}
+summary(practice_mod_norm_sam)
+```
+
+```{r}
+practice_mod_norm_sam <- readRDS("../objects/models/practice_mod_norm_sam_040122.rds")
+brms::conditional_effects(practice_mod_norm_sam, categorical = TRUE)
+```
+
+
+
+#### normality: error distribution
+
+```{r}
+practice_mod_norm_err <- brms::brm_multiple(
+  check_num_norm_err ~ 1 + scenario + tf_norm_mean + ri_teach + ri_subfield + uni_rank_cat + 
+    (1|id),
+  data = imp_data_list, 
+  family = cumulative("probit"), 
+  cores = 4, 
+  seed = 040122
+)
+
+saveRDS(practice_mod_norm_err, "../objects/models/practice_mod_norm_err_040122.rds")
+```
+
+```{r}
+summary(practice_mod_norm_err)
+```
+
+```{r}
+practice_mod_norm_err <- readRDS("../objects/models/practice_mod_norm_err_040122.rds")
+brms::conditional_effects(practice_mod_norm_err, categorical = TRUE, ask = F)
+```
+
+
+#### heteroscedasticity
+
+```{r}
+practice_mod_het <- brms::brm_multiple(
+  check_num_het ~ 1 + scenario + tf_het_mean + ri_teach + ri_subfield + uni_rank_cat + 
+    (1|id),
+  data = imp_data_list, 
+  family = cumulative("probit"), 
+  cores = 4, 
+  seed = 040122
+)
+
+saveRDS(practice_mod_het, "../objects/models/practice_mod_het_040122.rds")
+```
+
+```{r}
+summary(practice_mod_het)
+```
+
+```{r}
+practice_mod_het <- readRDS("../objects/models/practice_mod_het_040122.rds")
+brms::conditional_effects(practice_mod_het, categorical = TRUE)
+```
+
+
+#### outliers
+
+```{r}
+practice_mod_out <- brms::brm_multiple(
+  check_num_out ~ 1 + scenario + tf_out_inf_mean + ri_teach + ri_subfield + uni_rank_cat + 
+    (1|id),
+  data = imp_data_list, 
+  family = cumulative("probit"), 
+  cores = 4, 
+  seed = 040122
+)
+
+saveRDS(practice_mod_out, "../objects/models/practice_mod_out_040122.rds")
+#.rs.restartR()
+```
+
+```{r}
+summary(practice_mod_out)
+```
+
+```{r}
+practice_mod_out <- readRDS("../objects/models/practice_mod_out_040122.rds")
+brms::conditional_effects(practice_mod_out, categorical = TRUE)
+```
+
+
+#### influential cases 
+
+```{r}
+practice_mod_inf <- brms::brm_multiple(
+  check_num_inf ~ 1 + scenario + tf_out_inf_mean + ri_teach + ri_subfield + uni_rank_cat + 
+    (1|id),
+  data = imp_data_list, 
+  family = cumulative("probit"), 
+  cores = 4, 
+  seed = 040122
+)
+
+saveRDS(practice_mod_inf, "../objects/models/practice_mod_inf_040122.rds")
+
+```
+
+```{r}
+summary(practice_mod_inf)
+```
+
+```{r}
+practice_mod_inf <- readRDS("../objects/models/practice_mod_inf_040122.rds")
+brms::conditional_effects(practice_mod_inf, categorical = TRUE)
+```
+
+#### linearity
+
+```{r}
+practice_mod_lin <- brms::brm_multiple(
+  check_num_lin ~ 1 + scenario + tf_lin_mean + ri_teach + ri_subfield + uni_rank_cat + 
+    (1|id),
+  data = imp_data_list, 
+  family = cumulative("probit"), 
+  cores = 4, 
+  seed = 040122
+)
+
+saveRDS(practice_mod_lin, "../objects/models/practice_mod_lin_040122.rds")
+```
+
+```{r}
+summary(practice_mod_lin)
+```
+
+```{r}
+practice_mod_lin <- readRDS("../objects/models/practice_mod_lin_040122.rds")
+brms::conditional_effects(practice_mod_lin, categorical = TRUE)
+```
+
+
+#### independence
+
+```{r}
+practice_mod_ind <- brms::brm_multiple(
+  check_num_ind ~ 1 + scenario + tf_ind_mean + ri_teach + ri_subfield + uni_rank_cat + 
+    (1|id),
+  data = imp_data_list, 
+  family = cumulative("probit"), 
+  cores = 4, 
+  seed = 040122
+)
+
+saveRDS(practice_mod_ind, "../objects/models/practice_mod_ind_040122.rds")
+```
+
+```{r}
+summary(practice_mod_ind)
+```
+
+```{r}
+practice_mod_ind <- readRDS("../objects/models/practice_mod_ind_040122.rds")
+brms::conditional_effects(practice_mod_ind, categorical = TRUE)
+```
+

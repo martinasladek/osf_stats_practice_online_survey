@@ -1,0 +1,1131 @@
+---
+title: "Data cleaning"
+output: 
+  html_document:
+    theme: cosmo
+    highlight: tango
+  
+---
+
+Please note that this script is for information purposes only. The raw data files necessary for running this script are not included, as they contain information that could be used to identify the participants. The fully processed file that this script generates is available in a de-identified form in the folder `processed_data`. 
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(dplyr)
+library(ggplot2)
+library(magrittr)
+
+source("../scripts/helpers.R")
+```
+
+
+# Read and merge
+
+```{r warning = F, message = F}
+setwd("../data/raw_data")
+data_list <- lapply(list.files()[-1], readr::read_csv)
+```
+
+```{r}
+list.files("../data/raw_data")[-1]
+```
+
+Remove "display order" columns and Qualtrics name/description rows. 
+
+```{r}
+data_list <- lapply(
+  X = data_list, 
+  FUN = function(x){
+    x %<>%
+      dplyr::select(-c(contains("DO"))) %>% 
+      dplyr::filter(row_number() > 2)
+  }
+) 
+```
+
+List items/datasets 2 and 3 were presented with the same questions. Dataset 1 were only presented with MCQ questions + research info and none of the participants completed the exercise. Ideally, we want a dataset with columns from 1, and columns from 2 and 3 that are also in 1. 
+
+```{r}
+#which(names_2 %in% names_1)
+
+data_list[[1]] %<>% 
+  dplyr::mutate(recruitment = "email_mcq")
+
+data_list[[2]] %<>% 
+  dplyr::select(which(names(.) %in% names(data_list[[1]]))) %>% 
+  dplyr::mutate(recruitment = "email_mcq_exercise", 
+                consent_short = NA) # adding blank variable to allow rbind
+
+data_list[[3]] %<>% 
+  dplyr::select(which(names(.) %in% names(data_list[[1]]))) %>% 
+  dplyr::mutate(recruitment = "twitter_mcq_exercise")
+```
+
+Bind into a single dataset:
+
+```{r}
+data <- do.call(rbind.data.frame, data_list)
+```
+
+# -----
+
+# Initial cleaning
+
+Remove responses with progress below 25% percent. Turns out Qualtrics's percentage systems works out a bit strange and the percentage was calculated based on the version where a participant doesn't pass the screener and gets sent to the end of the survey. So people could have literally read the consent form and then quit, and would still get 25%. There were 3 participants who completed only the exercise and the demographics - their ids are in the first line of the filter below (for them, the 25% cut-off does not applt)
+
+
+```{r}
+data %<>% 
+  dplyr::mutate(
+    Progress = readr::parse_number(Progress), 
+    count_na = apply(is.na(.), 1, sum)
+    ) %>%  
+  dplyr::filter(
+    Progress > 25 | tolower(id) %in% c("6998i", "2733r", "hs02i"),
+    screener_researcher == "Yes, at least one of these applies to me.", 
+    screener_quant == "Yes", 
+    DistributionChannel != "preview")
+```
+
+Clean up names:
+
+```{r cleanup_tf_names, warning = FALSE}
+names_tidy <- c()
+for(i in 1:length(names(data))){
+  
+  name_i = names(data)[i]
+  name_i_split = name_i %>% stringr::str_split(., pattern = "")
+  name_i_char = name_i_split[[1]][1] %>% readr::parse_number() # returns NA if can't extract num
+  
+  if(!is.na(name_i_char)){
+    name_i = paste0("L", name_i)
+  }
+  
+  names_tidy = c(names_tidy, name_i)
+  
+}
+
+names(data) = names_tidy
+```
+
+Remove duplicates: 6 participants have submitted a fully completed survey twice (with a short interval between them). I'm selecting the first (earlier) submission from each participant.
+
+```{r}
+data %<>% 
+  dplyr::group_by(id) %>% 
+  dplyr::mutate(date = lubridate::as_datetime(StartDate)) %>% 
+  dplyr::filter(date == min(date)) %>% 
+  dplyr::ungroup()
+```
+
+
+# -----
+
+# Process data 
+
+```{r}
+pd <- new.env()
+```
+
+## Progress
+
+```{r}
+pd$progress <- data %>% 
+  dplyr::select(id, progress = Progress)
+```
+
+## Source
+
+```{r}
+pd$recruitment <- data %>%
+  dplyr::select(id, recruitment)
+```
+
+
+## -----
+
+## Knowlegde (true/false)
+
+Load helper file and define IDs
+
+```{r read_tf_helper_files, message = FALSE}
+# read helper file for tf statement scoring
+
+tf_ids <- readr::read_csv("../data/helper_files/tf_ids.csv") %>%
+  dplyr::mutate(
+    tf_id = paste0("tf_", statement_id, "_1")
+  )
+
+tf_ids_r <- tf_ids %>% 
+  dplyr::filter(new_correct == -1)
+
+
+tf_ids %<>%
+  dplyr::mutate(
+    tf_id_num = readr::parse_number(tf_id), 
+    as_cat = rep(c("norm", "het", "lin", "ind", "out_inf"), each = 10), 
+    tf_id_name = paste0("tf_", as_cat, "_", tf_id_num)
+  )
+```
+
+Select and reverse score:
+
+```{r}
+pd$tf <- data %>% 
+  dplyr::select(id, contains("tf")) %>% 
+  dplyr::mutate(
+    across(.cols = -id, .fns = as.numeric),
+    across(.cols = all_of(tf_ids_r$tf_id),
+           .fns = reverse_score_knowledge)
+  )
+
+names(pd$tf) <- c("id", tf_ids$tf_id_name)
+```
+
+Not computing summary scores at this point as these will be computed via passive imputation. 
+
+## -----
+
+## Practice 
+
+loop index for scenarios: 
+
+```{r s_check_loop_index}
+s_check_loop_index <- 
+  dplyr::tibble(
+    loop_index = 1:9,
+    assumption = c("Linearity and additivity", 
+                   "Independent errors", 
+                   "Absence of outliers", 
+                   "Absence of influential cases", 
+                   "Homogeneity of variance/homoscedasticity", 
+                   "Normal sampling distribution", 
+                   "Normally distributed errors", 
+                   "None of the above", 
+                   "I don't know")
+  )
+```
+
+### Selected as relevant 
+
+```{r}
+pd$selected_s1 <- data %>% 
+  dplyr::select(id, contains("scenario_1_which")) %>% 
+  dplyr::mutate(scenario = "s1")
+
+names(pd$selected_s1) = stringr::str_replace_all(string = (names(pd$selected_s1)), 
+                                                 pattern = "scenario_1_which", 
+                                                 replacement = "selected_relevant")
+
+###
+
+pd$selected_s2 <- data %>% 
+  dplyr::select(id, contains("scenario_2_which")) %>% 
+  dplyr::mutate(scenario = "s2")
+
+names(pd$selected_s2) = stringr::str_replace_all(string = (names(pd$selected_s2)), 
+                                                 pattern = "scenario_2_which", 
+                                                 replacement = "selected_relevant")
+
+
+###
+
+pd$selected <- dplyr::bind_rows(pd$selected_s1, pd$selected_s2) %>% 
+  dplyr::arrange(id, scenario)
+
+```
+
+Convert into selected vs not selected (0,1). If all 9 "selected_relevant" are missing, it's a missing value. If fewer than 9 are missing, it's a "not selected" value (If they thought none were relevant, they would have selected the option "None of the above"). 
+
+```{r}
+selected_fun <- function(x, na_count){
+  dplyr::case_when(
+    !is.na(x) ~ 1, 
+    is.na(x) & na_count == 9 ~ as.numeric(NA), 
+    is.na(x) ~ 0
+  )
+}
+
+pd$selected %<>% 
+  dplyr::mutate(
+    na_count = rowSums(is.na(.)),
+    across(
+      .cols = -c(id, scenario, na_count),
+      .fns = ~selected_fun(x = .x, na_count = na_count)
+    )
+  ) %>% 
+  dplyr::select(-na_count)
+
+
+```
+
+
+### Checking assumptions 
+
+```{r}
+pd$s1_check <- data %>%  
+  dplyr::select(id, contains("s1_check")) %>% 
+  dplyr::mutate(scenario = "s1")
+
+names(pd$s1_check) = stringr::str_remove_all(string = names(pd$s1_check), 
+                                             pattern = "s1_")
+
+#### 
+
+pd$s2_check <- data %>%  
+  dplyr::select(id, contains("s2_check")) %>% 
+  dplyr::mutate(scenario = "s2")
+
+names(pd$s2_check) = stringr::str_remove_all(string = names(pd$s2_check), 
+                                             pattern = "s2_")
+
+
+####
+
+pd$check <- dplyr::bind_rows(pd$s1_check, pd$s2_check) %>% 
+  dplyr::arrange(id, scenario)
+  
+```
+
+This needs to be merged with info about whether or not they selected the assumption (and if not, assign a score of 0), or not even got that far in the survey (assign genuine NA)
+
+```{r}
+pd$check <- dplyr::left_join(pd$check, pd$selected, by = c("id", "scenario"))
+```
+
+
+```{r}
+recode_check <- function(x, na_1, na_2, na_count){
+  x = dplyr::case_when(
+    na_count > 8 & na_1 == 0 & na_2 == 0 ~ as.numeric(NA), 
+    x == "I do not check for violations of this assumption nor do I apply any corrections" | 
+      (!is.na(na_1) & !is.na(na_2) & is.na(x)) ~ 0,
+    x == "I check for violations of this assumption, but I do not apply any corrections when I find that the assumption is violated." ~ 1,
+    x == "I do not check for violations of thiss assumption, but I apply corrections for potential violations anyway" ~ 2,
+    x == "I check for violations of this assumption and I also apply corrections when I detect violations." ~ 2
+  )
+}
+
+pd$check %<>% 
+  dplyr::mutate(
+    na_count = rowSums(is.na(.)), 
+    across(
+      .cols = -c(id, scenario, L8_check:selected_relevant_9, na_count),
+      .fns = ~recode_check(x = .x, na_1 = selected_relevant_8, na_2 = selected_relevant_9, na_count = na_count), 
+      .names = "{.col}_num"
+    ), 
+    L1_check_num = case_when(selected_relevant_1 == 1 & is.na(L1_check) ~ as.numeric(NA), TRUE ~ L1_check_num),
+    L2_check_num = case_when(selected_relevant_2 == 1 & is.na(L2_check) ~ as.numeric(NA), TRUE ~ L2_check_num),
+    L3_check_num = case_when(selected_relevant_3 == 1 & is.na(L3_check) ~ as.numeric(NA), TRUE ~ L3_check_num),
+    L4_check_num = case_when(selected_relevant_4 == 1 & is.na(L4_check) ~ as.numeric(NA), TRUE ~ L4_check_num),
+    L5_check_num = case_when(selected_relevant_5 == 1 & is.na(L5_check) ~ as.numeric(NA), TRUE ~ L5_check_num),
+    L6_check_num = case_when(selected_relevant_6 == 1 & is.na(L6_check) ~ as.numeric(NA), TRUE ~ L6_check_num),
+    L7_check_num = case_when(selected_relevant_7 == 1 & is.na(L7_check) ~ as.numeric(NA), TRUE ~ L7_check_num)
+  ) %>% 
+  dplyr::select(id, scenario, contains("num"))
+```
+
+### Not addressing assumptions 
+
+```{r}
+pd$n_check_s1 <- data %>% 
+  dplyr::select(id, contains("s1_n_check")) %>% 
+  #dplyr::select(-contains("TEXT")) %>% 
+  dplyr::mutate(scenario = "s1")
+
+names(pd$n_check_s1) = stringr::str_remove_all(string = names(pd$n_check_s1), 
+                                               pattern = "s1_")
+
+
+pd$n_check_s2 <- data %>% 
+  dplyr::select(id, contains("s2_n_check")) %>% 
+  #dplyr::select(-contains("TEXT")) %>% 
+  dplyr::mutate(scenario = "s2")
+
+names(pd$n_check_s2) = stringr::str_remove_all(string = names(pd$n_check_s2), 
+                                               pattern = "s2_")
+
+
+
+pd$n_check <- dplyr::bind_rows(pd$n_check_s1, pd$n_check_s2)
+```
+
+```{r}
+pd$n_check <- pd$n_check %>% 
+  dplyr::left_join(., pd$check, by = c("id", "scenario")) %>% 
+  dplyr::left_join(., pd$selected, by = c("id", "scenario"))
+```
+
+```{r}
+recode_n_check <- function(L_n_check, L_check_num, selected_relevant){
+  L_n_check = dplyr::case_when(
+    is.na(L_check_num) & (selected_relevant == 1 | is.na(selected_relevant)) ~ as.character(NA), 
+    selected_relevant == 0 ~ "Assumption not selected as relevant", 
+    L_check_num == 2 ~ "Checks and corrects violations", 
+    TRUE ~ L_n_check
+  )
+}
+
+pd$n_check %<>% 
+  dplyr::left_join(., pd$progress, by = "id") %>% 
+  dplyr::mutate(
+    L1_n_check = recode_n_check(L1_n_check, L1_check_num, selected_relevant_1), 
+    L2_n_check = recode_n_check(L2_n_check, L2_check_num, selected_relevant_2),
+    L3_n_check = recode_n_check(L3_n_check, L3_check_num, selected_relevant_3),
+    L4_n_check = recode_n_check(L4_n_check, L4_check_num, selected_relevant_4),
+    L5_n_check = recode_n_check(L5_n_check, L5_check_num, selected_relevant_5),
+    L6_n_check = recode_n_check(L6_n_check, L6_check_num, selected_relevant_6),
+    L7_n_check = recode_n_check(L7_n_check, L7_check_num, selected_relevant_7)
+  ) %>% 
+  dplyr::select(-progress, -contains("selected_relevant"), -contains("num"), 
+                -contains("L8"), - contains("L9"))
+```
+
+
+```{r}
+# pd$check$L1_check_num %>% unique()
+# 
+# pd$n_check$L1_n_check %>% unique()
+# pd$n_check$L1_n_check_7_TEXT %>% unique()
+```
+
+
+
+Recode "other" options: 
+
+```{r eval = FALSE}
+# linearity 
+pd$n_check %>% 
+  dplyr::select(id, scenario, L1_n_check_7_TEXT) %>% 
+  dplyr::filter(!is.na(L1_n_check_7_TEXT)) %>% 
+  write.csv(., "../data/helper_files/assumptions_other/linearity.csv", row.names = F)
+
+# independent errors
+pd$n_check %>% 
+  dplyr::select(id, scenario, L2_n_check_7_TEXT) %>% 
+  dplyr::filter(!is.na(L2_n_check_7_TEXT)) %>% 
+  write.csv(., "../data/helper_files/assumptions_other/independent_errors.csv", row.names = F)
+
+# outliers
+pd$n_check %>% 
+  dplyr::select(id, scenario, L3_n_check_7_TEXT) %>% 
+  dplyr::filter(!is.na(L3_n_check_7_TEXT)) %>% 
+  write.csv(., "../data/helper_files/assumptions_other/outliers.csv", row.names = F)
+
+# influential cases
+pd$n_check %>% 
+  dplyr::select(id, scenario, L4_n_check_7_TEXT) %>% 
+  dplyr::filter(!is.na(L4_n_check_7_TEXT)) %>% 
+  write.csv(., "../data/helper_files/assumptions_other/influential_cases.csv", row.names = F)
+
+# homoscendasticiry
+pd$n_check %>% 
+  dplyr::select(id, scenario, L5_n_check_7_TEXT) %>% 
+  dplyr::filter(!is.na(L5_n_check_7_TEXT)) %>% 
+  write.csv(., "../data/helper_files/assumptions_other/homoscedasticity.csv", row.names = F)
+
+# normal sampling dist. 
+pd$n_check %>% 
+  dplyr::select(id, scenario, L6_n_check_7_TEXT) %>% 
+  dplyr::filter(!is.na(L6_n_check_7_TEXT)) %>% 
+  write.csv(., "../data/helper_files/assumptions_other/normal_sampling_dist.csv", row.names = F)
+
+# normal errors
+pd$n_check %>% 
+  dplyr::select(id, scenario, L7_n_check_7_TEXT) %>% 
+  dplyr::filter(!is.na(L7_n_check_7_TEXT)) %>% 
+  write.csv(., "../data/helper_files/assumptions_other/normal_errors.csv", row.names = F)
+```
+
+
+```{r}
+# pd$n_check %>% 
+#   dplyr::select(id, scenario, L1_n_check:L7_n_check_7_TEXT) %>% 
+#   write.csv(., "../data/helper_files/assumptions_other/reasons_for_nor_checking_100122.csv")
+
+n_check_recoded <- read.csv("../data/helper_files/reasons_for_not_checking_recoded.csv", 
+                            encoding = "UTF-8")
+
+n_check_recoded %<>%
+  dplyr::mutate(
+    L1_n_check = if_else(L1_n_check == "Other (please specify)", n_check_lin_recoded, L1_n_check),
+    L2_n_check = if_else(L2_n_check == "Other (please specify)", n_check_ind_recoded, L2_n_check),
+    L3_n_check = if_else(L3_n_check == "Other (please specify)", n_check_out_recoded, L3_n_check),
+    L4_n_check = if_else(L4_n_check == "Other (please specify)", n_check_inf_recoded, L4_n_check),
+    L5_n_check = if_else(L5_n_check == "Other (please specify)", n_check_het_recoded, L5_n_check),
+    L6_n_check = if_else(L6_n_check == "Other (please specify)", n_check_norm_sam_recoded, L6_n_check),
+    L7_n_check = if_else(L7_n_check == "Other (please specify)", n_check_norm_err_recoded, L7_n_check)
+  ) 
+
+n_check_general <- read.csv("../data/helper_files/assumption_other_codes_general.csv", 
+                            encoding = "UTF-8") %>% 
+  dplyr::filter(!duplicated(n_check_x_recoded))
+
+
+recode_n_check_general <- function(n_check_variable, n_check_general){
+  
+  for(i in 1:length(n_check_general$n_check_x_recoded)){
+    
+    indices = which(n_check_variable == n_check_general$n_check_x_recoded[i]) 
+    n_check_variable[indices] = n_check_general$general_code[i]
+    
+  }
+  return(n_check_variable)
+}
+
+
+n_check_recoded %<>% 
+  dplyr::mutate(
+    L1_recoded = recode_n_check_general(L1_n_check, n_check_general), 
+    L2_recoded = recode_n_check_general(L2_n_check, n_check_general), 
+    L3_recoded = recode_n_check_general(L3_n_check, n_check_general), 
+    L4_recoded = recode_n_check_general(L4_n_check, n_check_general), 
+    L5_recoded = recode_n_check_general(L5_n_check, n_check_general), 
+    L6_recoded = recode_n_check_general(L6_n_check, n_check_general), 
+    L7_recoded = recode_n_check_general(L7_n_check, n_check_general), 
+  ) 
+
+#write.csv(n_check_recoded, "../data/processed_data/n_check_recoded_for_analysis.csv", row.names = F)
+
+```
+
+## -----
+
+## Use of methods 
+
+```{r}
+pd$methods_use <- data %>% dplyr::select(
+  id, methods_select_1:methods_select_23
+) 
+
+methods_labels <- c("Levene's test", 
+                    "Hartley's F or variance ratio", 
+                    "Shapiro-Wilk or Kolmogorov-Smirnov test",
+                    "Removing outliers from the dataset", 
+                    "Transforming data (e.g. log or square-root)", 
+                    "Plotting distribution of the outcome with a histogram", 
+                    
+                    "Plotting model residuals with QQ or PP plot", 
+                    "Plot of standardised residuals against predicted values", 
+                    "Boxplots", 
+                    "Cook's distance or leverage values", 
+                    "Z-scores for skewness and kurtosis", 
+                    "Z-scores or outliers", 
+                    "Welch F or Brown-Forsythe F", 
+                    "Classic non-parametric alternatve", 
+                    "Simple trimming", 
+                    "Heteroscedasticity-consistent standard errors", 
+                    "Fitting a multilevel model to address non-independence", 
+                    
+                    "Robust trimming", 
+                    "M-estimators", 
+                    "Winsorizing", 
+                    "Bootstrapping", 
+                    "Weighted least squares", 
+                    "Bayesian estimation"
+                    ) 
+
+pd$methods_use %<>% 
+  tidyr::pivot_longer(cols = -id, names_to = "method", values_to = "use") %>% 
+  tidyr::separate(method, into = c("old", "method"), sep = "_(?=[^_]+$)") %>% 
+  dplyr::transmute(id, method = factor(as.numeric(method), labels = methods_labels), use)
+
+```
+
+
+```{r}
+# pd$methods_n_use <- data %>% dplyr::select(
+#   id, `methods_n_use#1_1`:`methods_n_use#1_23`) %>%
+#   tidyr::pivot_longer(cols = -id, names_to = "method", values_to = "n_use_reason") %>% 
+#   tidyr::separate(method, into = c("old", "method"), sep = "_(?=[^_]+$)") %>% 
+#   dplyr::select(-old)
+# 
+# 
+# pd$methods_n_use_text <- data %>% dplyr::select(
+#   id, `methods_n_use#2_1_1`:`methods_n_use#2_23_1`) %>%
+#   tidyr::pivot_longer(cols = -id, names_to = "method", values_to = "n_use_reason_text") %>% 
+#   dplyr::mutate(method = stringr::str_remove_all(method, "_1")) %>% 
+#   tidyr::separate(method, into = c("old", "method"), sep = "_(?=[^_]+$)") %>% 
+#   dplyr::select(-old)
+# 
+# pd$methods_n_use %<>% 
+#   dplyr::left_join(., pd$methods_n_use_text, by = c("id", "method")) %>% 
+#   dplyr::mutate(method = factor(as.numeric(method), labels = methods_labels))
+
+
+#write.csv(pd$methods_n_use, "../data/processed_data/methods_n_use_reasons.csv", row.names = F)
+```
+
+```{r}
+pd$methods_n_use <- read.csv("../data/processed_data/methods_n_use_reasons_200122.csv")
+
+pd$methods_use %<>% 
+  dplyr::left_join(., pd$methods_n_use, by = c("id", "method")) %>% 
+  dplyr::mutate(
+    use = if_else(n_use_reason_recoded == "I use this method sometimes", "I've heard of this methods and I sometimes use it.", use)
+  )
+
+#write.csv(pd$methods_use, "../data/processed_data/methods_use_processed.csv", row.names = FALSE)
+```
+
+
+```{r}
+# pd$methods_use_rob <- pd$methods_use %>%  dplyr::select(
+#   id, 
+#   methods_select_13, methods_select_16, 
+#   methods_select_18:methods_select_22
+# )
+# 
+# names(pd$methods_use_rob) <- 
+#   c("id", 
+#     "method_use_welch", "method_use_hcse", "method_use_robtrim", 
+#     "method_use_mest", "method_use_wins", "method_use_boot", "method_use_wls")
+# 
+# recode_methods_use <- function(x){
+#   if_else(stringr::str_detect(x, "regularly use it"), 1, 0)
+# }
+# pd$methods_use_rob %<>% 
+#   dplyr::mutate(
+#     across(-id, 
+#            .fns = recode_methods_use)
+#   )
+
+```
+
+```{r}
+# data$`methods_n_use#2_1_1`
+# 
+# data$methods_select_1
+# 
+# data$`methods_n_use#1_1`
+```
+
+
+## -----
+
+## Researcher info 
+
+### Research methods teaching 
+
+```{r}
+pd$ri_teach <- data %>% 
+  dplyr::select(id, ri_teach)
+```
+
+### Psych subfield
+
+```{r}
+pd$ri_subfield <- read.csv("../data/helper_files/psych_subfield_recoded.csv")
+
+pd$ri_subfield %<>% 
+  dplyr::mutate(
+    ri_subfield = case_when(
+      ri_research_area == "Other (please specify)" ~ ri_subfield_recoded, 
+      TRUE ~ ri_research_area
+    )
+  ) %>% 
+  dplyr::select(id, ri_subfield)
+```
+
+### Level 
+
+"Other" needs to be coded, and then recode into PhD / postdoc / faculty
+
+```{r}
+pd$level <- read.csv("../data/helper_files/academic_level_recoded.csv") %>% 
+  dplyr::mutate(
+    demo_level = case_when(
+      demo_level == "Other (please specify)" ~ demo_level_recoded, 
+      TRUE ~ demo_level
+    ), 
+    demo_level = case_when(
+      demo_level %in% c("Lecturer", "Senior lecturer", "Professor") ~ "Faculty", 
+      demo_level %in% c("PhD student / PhD researcher / PhD candidate") ~ "PhD researcher",
+      TRUE ~ demo_level
+    )
+  ) %>% dplyr::select(id, demo_level)
+```
+
+### Hypothesis testing 
+
+```{r}
+# pd$ht <- data %>% 
+#   dplyr::select(id, contains("preferred_ht")) 
+# 
+# pd$ht %>% write.csv(., "../data/helper_files/preferred_ht.csv", row.names = F)
+
+pd$ht <- read.csv("../data/helper_files/preferred_ht_recoded.csv") %>% 
+  dplyr::mutate(
+    ri_preferred_ht = case_when(
+      ri_preferred_ht == "Other (please specify)" ~ ri_preferred_ht_recoded, 
+      TRUE ~ ri_preferred_ht
+    )
+  ) %>% dplyr::select(id, ri_preferred_ht)
+
+```
+
+### Stats software 
+
+```{r}
+pd$software <-  data %>% 
+  dplyr::select(id, contains("software"))
+
+software_names <- c("excel", "jasp", "julia", "matlab", "python", "r", "sas", "spss", "stata", "other", "TEXT")
+names(pd$software)[2:12] <- c(paste0("ri_software_", software_names))
+```
+
+```{r}
+find_method <- function(search_where, search_string, na_count){
+  case_when(
+    stringr::str_detect(search_where, search_string) ~ 1, 
+    na_count == 11 ~ as.numeric(NA), 
+    TRUE ~ 0
+  )
+}
+
+recode_software <- function(x, na_count){
+  dplyr::case_when(
+    na_count == 11 ~ as.numeric(NA),
+    na_count < 11 & !is.na(x) ~ 1,
+    na_count < 11 & is.na(x) ~ 0
+  )
+}
+
+pd$software %<>% 
+  dplyr::mutate(
+    na_count = rowSums(is.na(.)),
+    across(
+      .cols = c(ri_software_excel:ri_software_other),
+      .fns = ~recode_software(x = .x, na_count = na_count)
+    ), 
+    ri_software_mplus  = find_method(search_where = tolower(ri_software_TEXT), search_string = "mplus", na_count), 
+    ri_software_jamovi = find_method(search_where = tolower(ri_software_TEXT), search_string = "jamovi|jamovee", na_count), 
+    ri_software_amos   = find_method(search_where = tolower(ri_software_TEXT), search_string = "amos", na_count)
+  ) %>% 
+  dplyr::select(id, ri_software_excel:ri_software_other, 
+                ri_software_mplus, ri_software_jamovi, ri_software_amos, ri_software_TEXT)
+```
+
+```{r}
+n_participants <- nrow(pd$software)
+
+
+pd$software |> 
+  dplyr::select(-ri_software_TEXT) |> 
+  tidyr::pivot_longer(-id, names_to = "software", values_to = "is_used") |> 
+  dplyr::group_by(software) |> 
+  dplyr::summarise(
+    n_use = sum(is_used, na.rm = TRUE)
+  ) |> 
+  dplyr::arrange(desc(n_use)) |> 
+  dplyr::mutate(
+    perc = n_use / n_participants * 100
+  )
+
+(pd$software |> dplyr::filter(ri_software_r == 0, ri_software_spss == 1) |> nrow()) / n_participants
+
+(pd$software |> dplyr::filter(ri_software_r == 1, ri_software_spss == 1) |> nrow()) / n_participants
+
+(pd$software |> dplyr::filter(ri_software_r == 1, ri_software_spss == 0) |> nrow()) / n_participants
+
+(pd$software |> dplyr::filter(ri_software_excel == 1) |> nrow()) / n_participants
+
+(pd$software |> dplyr::filter(ri_software_jamovi == 1) |> nrow()) / n_participants
+
+(pd$software |> dplyr::filter(ri_software_jasp == 1) |> nrow()) / n_participants
+
+```
+
+
+### University 
+
+```{r}
+pd$uni <- read.csv("../data/helper_files/submitted_unis_w_countries.csv", encoding = "UTF-8") %>% 
+  dplyr::mutate(
+    uni = tolower(uni), 
+    uni_name = tolower(uni_name), 
+    uni_rank = rank, 
+    uni_rank_cat = rank_cat, 
+    uni_country = country
+  )
+
+world_ranks_2021 <- read.csv("../data/helper_files/processed_ranks_2021.csv", encoding = "UTF-8") %>% 
+  dplyr::transmute(
+    world_rank = ranking,
+    uni_name = tolower(title)
+  )
+
+pd$uni <- dplyr::left_join(pd$uni, world_ranks_2021, by = "uni_name") %>% 
+  dplyr::select(
+    id, rank, world_rank, uni_name
+  ) 
+```
+
+
+
+## -----
+
+## Demographics 
+
+### Gender
+
+```{r}
+pd$gender <- data %>% 
+  dplyr::select(id, contains("gender")) %>% 
+  dplyr::mutate(
+    demo_gender = case_when(
+      demo_gender == "Male" ~ "Man", 
+      demo_gender == "Female" ~ "Woman", 
+      demo_gender_6_TEXT %in% c("Genderqueer (woman?)") ~ "Genderqueer", 
+      demo_gender_6_TEXT %in% c("a", "You do not need to know this", 
+                                "Not relevant", "Ostrich", "Questioning",
+                                "Female sex, no gender identity", 
+                                "I do not know what gender is. But sex: male.") ~ "Not specified", 
+      # regarding the last case - I did fluff up the wording (should have been man/woman) but I asked about gender identity
+      # not 'sex'. Therefore I'm not going to make any assumptions about this person's identity, 
+      # otherwise I might have to code it as "bellend".
+      is.na(demo_gender) ~ "Not specified",
+      demo_gender == "Prefer to self-describe:" & is.na(demo_gender_6_TEXT) ~ "Not specified", 
+      demo_gender_6_TEXT %in% c("gender should be man/woman  not biological male/female. I identify as a woman ;)") ~ "Woman",
+      # my b
+      TRUE ~ demo_gender
+    )
+  )
+
+```
+
+### Age 
+
+```{r}
+pd$age <- data %>% 
+  dplyr::select(id, contains("_age")) %>% 
+  dplyr::mutate(
+    demo_age = readr::parse_number(demo_age), 
+    demo_age = case_when(
+      demo_age == 1973 ~ (2021 - 1973), 
+      demo_age == 5000 ~ as.double(NA), 
+      TRUE ~ demo_age
+    )
+  )
+```
+
+## -----
+
+## Merge all
+
+```{r}
+pd$ri <- 
+  dplyr::left_join(pd$ri_teach, pd$ri_subfield, by = "id") %>%
+  dplyr::left_join(., pd$progress, by = "id") %>%
+  dplyr::left_join(., pd$recruitment, by = "id") %>%
+  dplyr::left_join(., pd$uni, by = "id") %>%
+  dplyr::left_join(., pd$level, by = "id") %>%
+  dplyr::left_join(., pd$ht, by = "id") %>%
+  dplyr::left_join(., pd$age, by = "id") %>%
+  dplyr::left_join(., pd$gender, by = "id")
+  
+
+pd$ri %<>% 
+  dplyr::mutate(na_count = apply(is.na(.), 1, sum)) %>%
+  dplyr::group_by(id) %>% 
+    dplyr::mutate(
+    select = case_when(
+      !any(duplicated(id)) ~ 1, 
+       any(duplicated(id)) & na_count == min(na_count) ~ 1,
+       any(duplicated(id))  ~ 0
+    )
+  ) %>% 
+  dplyr::filter(select == 1) %>%
+  dplyr::select(-c(na_count, select, demo_gender_6_TEXT))
+
+```
+
+amend names for easier selection:
+
+```{r}
+names(pd$selected) <- c("id", 
+                        "selected_relevant_lin", "selected_relevant_ind", "selected_relevant_out", "selected_relevant_inf",
+                        "selected_relevant_het", "selected_relevant_norm_sam", "selected_relevant_norm_err", 
+                        "selected_relevant_none", "selected_relevant_dontknow", "scenario")
+
+pd$selected_wide <- pd$selected %>% 
+  tidyr::pivot_wider(data = ., 
+                     id_cols = c("id", "scenario"), 
+                     names_from = "scenario", 
+                     names_glue = "{scenario}_{.value}",
+                     values_from = selected_relevant_lin:selected_relevant_dontknow)
+
+```
+
+```{r}
+names(pd$check) <- c("id", "scenario", 
+                     "check_num_lin", "check_num_ind", "check_num_out", "check_num_inf", 
+                     "check_num_het", "check_num_norm_sam", "check_num_norm_err")
+
+pd$check_wide <- pd$check %>% 
+  tidyr::pivot_wider(data = ., 
+                     id_cols = c("id", "scenario"), 
+                     names_from = "scenario", 
+                     names_glue = "{scenario}_{.value}",
+                     values_from = check_num_lin:check_num_norm_err)
+
+```
+
+```{r}
+pd$n_check %<>% dplyr::select(-contains("TEXT"))
+
+names(pd$n_check) <- c("id", 
+                         "n_check_lin", "n_check_ind", "n_check_out", "n_check_inf", 
+                         "n_check_het", "n_check_norm_sam", "n_check_norm_err", 
+                         "scenario")
+
+pd$n_check_wide <- pd$n_check %>% 
+  tidyr::pivot_wider(data = ., 
+                     id_cols = c("id", "scenario"), 
+                     names_from = "scenario", 
+                     names_glue = "{scenario}_{.value}",
+                     values_from = n_check_lin:n_check_norm_err)
+
+pd$n_check_wide
+```
+
+
+```{r}
+pd$full_data <- pd$ri %>%
+  dplyr::left_join(., pd$tf, by = "id") %>%
+  dplyr::left_join(., pd$selected_wide, by = "id") %>%
+  dplyr::left_join(., pd$check_wide, by = "id") %>%
+  dplyr::left_join(., pd$n_check_wide, by = "id") %>%
+ # dplyr::left_join(., pd$methods_use_rob, by  = "id") %>% 
+  dplyr::left_join(., pd$methods_use, by  = "id")
+
+```
+
+Save data
+
+```{r}
+# write.csv(pd$full_data,
+#           "../data/processed_data/stats_practice_processed_data_RENAME.csv",
+#           row.names = FALSE)
+```
+
+
+
+
+
+
+
+## -----
+
+## VP Disserttion data 
+
+Select relevant data
+
+```{r}
+diss <- new.env()
+```
+
+
+```{r}
+diss$tf <- pd$tf
+```
+
+
+```{r}
+diss$selected_relevant_wide <- pd$selected_wide %>%
+  dplyr::select(id, s1_selected_relevant_out:s2_selected_relevant_norm_err)
+
+diss$selected_relevant_s1 <- diss$selected_relevant_wide %>%
+  dplyr::select(id, contains("s1"))  %>% 
+  dplyr::mutate(scenario = "s1")
+
+
+names(diss$selected_relevant_s1) <- 
+  stringr::str_replace_all(names(diss$selected_relevant_s1), "s1_", "")
+
+#### 
+
+diss$selected_relevant_s2 <- diss$selected_relevant_wide %>%
+  dplyr::select(id, contains("s2")) %>% 
+  dplyr::mutate(scenario = "s2")
+
+names(diss$selected_relevant_s2) <- 
+  stringr::str_replace_all(names(diss$selected_relevant_s1), "s2_", "")
+
+diss$selected_relevant <- dplyr::bind_rows(
+  diss$selected_relevant_s1, diss$selected_relevant_s2
+)
+
+```
+
+
+```{r}
+diss$check <- pd$check %>% dplyr::select(id, scenario, check_num_out:check_num_norm_err)
+```
+
+
+```{r}
+diss$methods_use_rob <- pd$methods_use_rob
+```
+
+
+Get analysis exercise IDs and outcomes
+
+```{r}
+ae_data <- 
+  readr::read_csv("../data/processed_data/analysis_exercise_processed_data_2021_10_07.csv") %>% 
+  dplyr::select(id, scenario, cat_norm:cat_inf)
+```
+
+Merge with diss data 
+
+```{r}
+diss$full_data <- 
+  ae_data %>% 
+  dplyr::left_join(., pd$gender, by = c("id")) %>% 
+  dplyr::left_join(., pd$age, by = c("id")) %>% 
+  dplyr::left_join(., pd$ri_teach, by = c("id")) %>% 
+  dplyr::left_join(., pd$uni, by = c("id")) %>% 
+  dplyr::left_join(., pd$level, by = c("id")) %>% 
+  dplyr::left_join(., pd$tf, by = c("id")) %>% 
+  dplyr::left_join(., pd$methods_use_rob, by = c("id")) %>% 
+  dplyr::left_join(., diss$selected_relevant, by = c("id", "scenario")) %>% 
+  dplyr::left_join(., diss$check, by = c("id", "scenario"))
+
+diss$full_data %<>% 
+  dplyr::mutate(
+    demo_gender = case_when(is.na(demo_gender) ~"Not specified", TRUE ~ demo_gender), 
+    world_rank = case_when(
+      rank == -99 ~ as.integer(1500), 
+      rank == -999 ~ as.integer(-999), 
+      is.na(rank) ~ as.integer(NA),
+      TRUE ~ world_rank
+    ), 
+    rank_cat = case_when(
+      world_rank == 1500 ~ 4, 
+      world_rank %in% c(501:1001) ~ 3,
+      world_rank %in% c(201:500) ~ 2,
+      world_rank %in% c(1:200) ~ 1
+    )
+  ) %>% dplyr::select(-demo_gender_6_TEXT, -uni_name, -rank, -world_rank) 
+```
+
+```{r}
+sum(complete.cases(diss$full_data))
+
+complete_cases <- diss$full_data[complete.cases(diss$full_data), ] %>% 
+  dplyr::arrange(id) %>% 
+  dplyr::group_by(id) %>% 
+  dplyr::mutate(both_cases = any(duplicated(id)))
+
+cc_no_uni <- diss$full_data %>% dplyr::select(-rank_cat)
+cc_no_uni <- cc_no_uni[complete.cases(cc_no_uni), ] %>% 
+  dplyr::arrange(id) %>% 
+  dplyr::group_by(id) %>% 
+  dplyr::mutate(both_cases = any(duplicated(id)))
+
+
+cc_no_teach <- diss$full_data %>% dplyr::select(-ri_teach)
+cc_no_teach <- cc_no_teach[complete.cases(cc_no_teach), ] %>% 
+  dplyr::arrange(id) %>% 
+  dplyr::group_by(id) %>% 
+  dplyr::mutate(both_cases = any(duplicated(id)))
+
+
+cc_no_age <- diss$full_data %>% dplyr::select(-demo_age)
+cc_no_age <- cc_no_age[complete.cases(cc_no_age), ] %>% 
+  dplyr::arrange(id) %>% 
+  dplyr::group_by(id) %>% 
+  dplyr::mutate(both_cases = any(duplicated(id)))
+
+cc_no_age %>% dplyr::filter(both_cases == F)
+
+cc_no_age
+```
+
+```{r}
+#write.csv(diss$full_data, "../data/processed_data/dissertation_data_29_11_2021.csv", row.names = F)
+```
+
+
+Models: 
+
+Level 1
+
+$$
+ln
+\left(
+\frac{P(\mbox{observed practice}^a \leq c)}{1-P(\mbox{observed practice}^a \leq c)}
+\right) 
+= 
+\alpha^{(c)}_{j} - \phi \quad\quad\quad\quad (c = 1,2,3,4,5) 
+$$
+$$
+\begin{split}
+\phi = \hat{\gamma}_{1j}\mbox{self-reported practice}^a_{ij}  & + \hat{\gamma}_{2}\mbox{knowledge}^a_{j} \\
+& + \hat{\gamma}_{3}\mbox{teach}_{j} \\
+& + \hat{\gamma}_{4}\mbox{uni rank}_{j} \\
+& + \hat{\gamma}_{5j}\mbox{scenario}_{ij} \\
+& + \epsilon_{ij}
+\end{split}
+$$
+$$
+\begin{split}
+\alpha^{(c)}_{ij} &= \alpha^{(c)}  + \hat{u}^{(c)}_{j} \\
+\hat{\gamma}_{1j}& = \hat{\gamma}_1  + \hat{u}_{1j} \\
+\hat{\gamma}_{5j}& = \hat{\gamma}_1  + \hat{u}_{5j}
+\end{split}
+$$
+
+
+
+
+
+## -----
+
+## Merge exercise ids with researcher info and demos 
+
+This is only for the purposes of having the info for the analysis exercise - don't use this for anything to do with the stats practice survey
+
+```{r}
+epd <- new.env()
+```
+
+```{r}
+epd$id <- readr::read_csv("../data/helper_files/exercise_ids.csv")
+``` 
+
+```{r}
+epd$ri <- epd$id %>% 
+  dplyr::left_join(., pd$uni, by = "id") %>% 
+  dplyr::left_join(., pd$ri_subfield, by = "id") %>% 
+  dplyr::left_join(., pd$ht, by = "id") %>% 
+  dplyr::left_join(., pd$level, by = "id") %>% 
+  dplyr::left_join(., pd$ri_teach, by = "id") %>% 
+  dplyr::left_join(., pd$software, by = "id") 
+
+epd$demo <- epd$id %>% 
+  dplyr::left_join(., pd$gender, by = "id") %>%
+  dplyr::left_join(., pd$age, by = "id") %>% 
+  dplyr::left_join(., pd$level, by = "id") %>% 
+  dplyr::left_join(., pd$recruitment, by = "id")
+
+
+epd$demo %<>% 
+  dplyr::mutate(
+    demo_gender = case_when(is.na(demo_gender) ~"Not specified", TRUE ~ demo_gender)
+  )
+
+
+```
+
+```{r}
+#write.csv(epd$ri, "../data/helper_files/analysis_exercise_ri_merged.csv", row.names = F)
+```
+
+
+```{r}
+#saveRDS(epd$demo, "../objects/analysis_exercise_demo_merged.rds")
+```
+

@@ -981,23 +981,30 @@ mice::densityplot(x = imputed_data, data = ~s2_check_num_inf)
 # Compute FMI
 
 ```{r}
-
 imputed_data_long <- mice::complete(imputed_data, "long", include = TRUE)
 
 imputed_data_s1 <- imputed_data_long %>%
-  dplyr::select(.imp:tf_out_inf_50, methods_select_1:tf_out_inf_mean, contains("s1")) %>% 
+  dplyr::select(!contains("s2")) %>% 
   dplyr::mutate(scenario = "s1")
 
 
 imputed_data_s2 <- imputed_data_long %>%
-  dplyr::select(.imp:tf_out_inf_50, methods_select_1:tf_out_inf_mean, contains("s2")) %>% 
+  dplyr::select(!contains("s1")) %>% 
   dplyr::mutate(scenario = "s2")
 
 names(imputed_data_s1) <- stringr::str_remove_all(pattern = "s1_", string = names(imputed_data_s1))
 names(imputed_data_s2) <- stringr::str_remove_all(pattern = "s2_", string = names(imputed_data_s2))
 
-imp_data_long <- rbind.data.frame(imputed_data_s1, imputed_data_s2)
 
+```
+
+
+```{r}
+imp_data_long <- rbind.data.frame(imputed_data_s1, imputed_data_s2)
+```
+
+
+```{r}
 imp_data_long %<>%
   dplyr::mutate(
     across(
